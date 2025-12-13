@@ -14,10 +14,14 @@ extern std::unique_ptr<ModelLoader> g_model_loader;
 class LFM2Model {
 public:
     LFM2Model(const std::string& model_file);
-    
-    // Forward pass
+
+    // Forward pass (single sequence)
     void forward(const std::vector<int>& input_ids, Tensor& logits);
-    
+
+    // Batched forward pass (multiple sequences) - OPTIMIZATION 3.2
+    void forward_batch(const std::vector<std::vector<int>>& input_ids_batch,
+                       std::vector<Tensor>& logits_batch);
+
 private:
     std::unique_ptr<ModelLoader> loader_;
     

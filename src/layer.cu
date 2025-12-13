@@ -462,7 +462,6 @@ __global__ void fused_mul_transpose_kernel(const float* __restrict__ C,
 // ============================================================================
 
 // Global GPU buffers (persistent across forward passes)
-static bool g_gpu_initialized = false;
 static float* g_gpu_buffer = nullptr;
 static size_t g_gpu_buffer_size = 0;
 
@@ -620,27 +619,42 @@ void softmax(const Tensor& x, Tensor& y, int dim) {
     }
 }
 
-// Normalization
+// Normalization - GPU accelerated using rms_norm_kernel
 void rms_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& y) {
+    // =========================================================================
+    // OPTIMIZATION 3.1: GPU RMSNorm Implementation
+    // Replaces CPU fallback with GPU kernel (rms_norm_kernel)
+    // =========================================================================
+
     size_t outer_size = 1;
     for (size_t i = 0; i < x.ndim() - 1; i++) {
         outer_size *= x.size(i);
     }
     size_t hidden_size = x.size(-1);
+    size_t total_size = outer_size * hidden_size;
 
-    #pragma omp parallel for
-    for (size_t i = 0; i < outer_size; i++) {
-        float sum_sq = 0.0f;
-        for (size_t j = 0; j < hidden_size; j++) {
-            float val = x[i * hidden_size + j];
-            sum_sq += val * val;
-        }
-        float rms = std::sqrt(sum_sq / hidden_size + eps);
+    // Allocate GPU memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, total_size * sizeof(float));
+    cudaMalloc(&d_weight, hidden_size * sizeof(float));
+    cudaMalloc(&d_output, total_size * sizeof(float));
 
-        for (size_t j = 0; j < hidden_size; j++) {
-            y[i * hidden_size + j] = (x[i * hidden_size + j] / rms) * weight[j];
-        }
-    }
+    // Upload data to GPU
+    cudaMemcpy(d_input, x.data(), total_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight.data(), hidden_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch RMSNorm kernel
+    // Each block handles one row (outer_size rows, hidden_size columns)
+    int block_size = 256;  // Threads per block for reduction
+    rms_norm_kernel<<<outer_size, block_size>>>(d_input, d_weight, d_output, outer_size, hidden_size, eps);
+
+    // Download result
+    cudaMemcpy(y.data(), d_output, total_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free GPU memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
 }
 
 // RoPE operations

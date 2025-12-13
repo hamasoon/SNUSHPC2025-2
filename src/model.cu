@@ -439,6 +439,115 @@ private:
 static bool g_embedding_uploaded = false;
 
 // ============================================================================
+// OPTIMIZATION 3.3: CUDA Stream Manager for Async Memory Transfers
+// ============================================================================
+
+class CUDAStreamManager {
+public:
+    static CUDAStreamManager& instance() {
+        static CUDAStreamManager inst;
+        return inst;
+    }
+
+    // Streams for different operations
+    cudaStream_t compute_stream;
+    cudaStream_t h2d_stream;  // Host to Device
+    cudaStream_t d2h_stream;  // Device to Host
+
+    bool initialized = false;
+
+    void init() {
+        if (initialized) return;
+
+        cudaStreamCreate(&compute_stream);
+        cudaStreamCreate(&h2d_stream);
+        cudaStreamCreate(&d2h_stream);
+
+        initialized = true;
+    }
+
+    ~CUDAStreamManager() {
+        if (initialized) {
+            cudaStreamDestroy(compute_stream);
+            cudaStreamDestroy(h2d_stream);
+            cudaStreamDestroy(d2h_stream);
+        }
+    }
+
+    // Async H2D transfer
+    void async_h2d(void* dst, const void* src, size_t size) {
+        cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, h2d_stream);
+    }
+
+    // Async D2H transfer
+    void async_d2h(void* dst, const void* src, size_t size) {
+        cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, d2h_stream);
+    }
+
+    // Wait for H2D transfers to complete
+    void sync_h2d() {
+        cudaStreamSynchronize(h2d_stream);
+    }
+
+    // Wait for D2H transfers to complete
+    void sync_d2h() {
+        cudaStreamSynchronize(d2h_stream);
+    }
+
+    // Wait for compute to complete
+    void sync_compute() {
+        cudaStreamSynchronize(compute_stream);
+    }
+
+    // Wait for all streams
+    void sync_all() {
+        cudaStreamSynchronize(h2d_stream);
+        cudaStreamSynchronize(d2h_stream);
+        cudaStreamSynchronize(compute_stream);
+    }
+
+private:
+    CUDAStreamManager() = default;
+    CUDAStreamManager(const CUDAStreamManager&) = delete;
+    CUDAStreamManager& operator=(const CUDAStreamManager&) = delete;
+};
+
+// Pinned memory allocator for faster H2D/D2H transfers
+class PinnedMemoryPool {
+public:
+    static PinnedMemoryPool& instance() {
+        static PinnedMemoryPool inst;
+        return inst;
+    }
+
+    // Allocate pinned memory
+    void* allocate(size_t size) {
+        void* ptr;
+        cudaMallocHost(&ptr, size);
+        allocations_.push_back(ptr);
+        return ptr;
+    }
+
+    // Free all allocations (call at program end)
+    void free_all() {
+        for (void* ptr : allocations_) {
+            cudaFreeHost(ptr);
+        }
+        allocations_.clear();
+    }
+
+    ~PinnedMemoryPool() {
+        free_all();
+    }
+
+private:
+    std::vector<void*> allocations_;
+    PinnedMemoryPool() = default;
+    PinnedMemoryPool(const PinnedMemoryPool&) = delete;
+    PinnedMemoryPool& operator=(const PinnedMemoryPool&) = delete;
+};
+
+// ============================================================================
 // GPU Tensor Class for persistent GPU storage
 // ============================================================================
 
@@ -1408,4 +1517,107 @@ void LFM2Model::forward(const std::vector<int>& input_ids, Tensor& logits) {
     Tensor last_hidden_flat = last_hidden.view({batch, HIDDEN_SIZE});
     logits = Tensor({batch, VOCAB_SIZE});
     tensor_ops::matmul_transposed(last_hidden_flat, lm_head_, logits);
+}
+
+// ============================================================================
+// OPTIMIZATION 3.2: Batched Forward Pass for Multiple Sequences
+// ============================================================================
+
+void LFM2Model::forward_batch(const std::vector<std::vector<int>>& input_ids_batch,
+                               std::vector<Tensor>& logits_batch) {
+    size_t num_sequences = input_ids_batch.size();
+    if (num_sequences == 0) return;
+
+    // Find max sequence length for padding
+    size_t max_seq_len = 0;
+    for (const auto& seq : input_ids_batch) {
+        max_seq_len = std::max(max_seq_len, seq.size());
+    }
+
+    // Process sequences in true batch (batch > 1)
+    size_t batch = num_sequences;
+
+    // Create padded input tensor
+    Tensor hidden_states({batch, max_seq_len, HIDDEN_SIZE});
+    hidden_states.zero();
+
+    // GPU-accelerated batched embedding lookup
+    int* d_tokens;
+    float *d_embed_table, *d_output;
+    size_t total_tokens = batch * max_seq_len;
+
+    cudaMalloc(&d_tokens, total_tokens * sizeof(int));
+    cudaMalloc(&d_embed_table, VOCAB_SIZE * HIDDEN_SIZE * sizeof(float));
+    cudaMalloc(&d_output, total_tokens * HIDDEN_SIZE * sizeof(float));
+
+    // Create padded token array (pad with 0s)
+    std::vector<int> padded_tokens(total_tokens, 0);
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t s = 0; s < input_ids_batch[b].size(); s++) {
+            padded_tokens[b * max_seq_len + s] = input_ids_batch[b][s];
+        }
+    }
+
+    // Upload tokens and embedding table
+    cudaMemcpy(d_tokens, padded_tokens.data(), total_tokens * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_embed_table, embed_tokens_.data(), VOCAB_SIZE * HIDDEN_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch batched embedding lookup
+    int total_elements = total_tokens * HIDDEN_SIZE;
+    int blocks = (total_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    embedding_lookup_kernel<<<blocks, BLOCK_SIZE>>>(d_tokens, d_embed_table, d_output, total_tokens, HIDDEN_SIZE);
+
+    // Download embeddings
+    cudaMemcpy(hidden_states.data(), d_output, total_tokens * HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_tokens);
+    cudaFree(d_embed_table);
+    cudaFree(d_output);
+
+    // Compute RoPE embeddings
+    Tensor cos({max_seq_len, HEAD_DIM});
+    Tensor sin({max_seq_len, HEAD_DIM});
+    rotary_emb_->forward(max_seq_len, cos, sin);
+
+    // Pass through decoder layers
+    Tensor* attention_mask = nullptr;
+    for (size_t i = 0; i < NUM_HIDDEN_LAYERS; i++) {
+        Tensor output({batch, max_seq_len, HIDDEN_SIZE});
+        layers_[i]->forward(hidden_states, cos, sin, attention_mask, output);
+        hidden_states = output;
+    }
+
+    // Final norm
+    Tensor normed_output({batch, max_seq_len, HIDDEN_SIZE});
+    norm_->forward(hidden_states, normed_output);
+
+    // Extract last token for each sequence and compute logits
+    logits_batch.resize(batch);
+
+    // Get actual sequence lengths for each batch item
+    std::vector<size_t> seq_lengths(batch);
+    for (size_t b = 0; b < batch; b++) {
+        seq_lengths[b] = input_ids_batch[b].size();
+    }
+
+    // Process all sequences together for LM head
+    Tensor last_hidden({batch, 1, HIDDEN_SIZE});
+    for (size_t b = 0; b < batch; b++) {
+        size_t last_pos = seq_lengths[b] - 1;
+        for (size_t i = 0; i < HIDDEN_SIZE; i++) {
+            last_hidden.at(b, 0, i) = normed_output.at(b, last_pos, i);
+        }
+    }
+
+    Tensor last_hidden_flat = last_hidden.view({batch, HIDDEN_SIZE});
+    Tensor all_logits({batch, VOCAB_SIZE});
+    tensor_ops::matmul_transposed(last_hidden_flat, lm_head_, all_logits);
+
+    // Split logits into individual tensors
+    for (size_t b = 0; b < batch; b++) {
+        logits_batch[b] = Tensor({1, VOCAB_SIZE});
+        for (size_t v = 0; v < VOCAB_SIZE; v++) {
+            logits_batch[b].at(0, v) = all_logits.at(b, v);
+        }
+    }
 }
