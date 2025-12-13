@@ -120,54 +120,6 @@ static __global__ void matmul_kernel(const float* __restrict__ A,
         C[row * N + col] = sum;
     }
 }
-
-// RMS normalization kernel
-static __global__ void rms_norm_kernel(const float* __restrict__ input,
-                                const float* __restrict__ weight,
-                                float* __restrict__ output,
-                                int outer_size, int hidden_size, float eps) {
-    int idx = blockIdx.x;
-    if (idx >= outer_size) return;
-
-    const float* in_ptr = input + idx * hidden_size;
-    float* out_ptr = output + idx * hidden_size;
-
-    float sum_sq = 0.0f;
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        float val = in_ptr[d];
-        sum_sq += val * val;
-    }
-
-    // Warp reduction
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
-    }
-
-    __shared__ float warp_sums[32];
-    int lane = threadIdx.x % 32;
-    int warp_id = threadIdx.x / 32;
-
-    if (lane == 0) warp_sums[warp_id] = sum_sq;
-    __syncthreads();
-
-    if (warp_id == 0) {
-        sum_sq = (lane < (blockDim.x + 31) / 32) ? warp_sums[lane] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
-        }
-    }
-
-    __shared__ float rms;
-    if (threadIdx.x == 0) {
-        rms = sqrtf(sum_sq / hidden_size + eps);
-    }
-    __syncthreads();
-
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        out_ptr[d] = (in_ptr[d] / rms) * weight[d];
-    }
-}
-
 // SiLU activation kernel
 static __global__ void silu_kernel(const float* __restrict__ input,
                             float* __restrict__ output, int size) {
@@ -185,116 +137,6 @@ static __global__ void mul_kernel(const float* __restrict__ a,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         c[idx] = a[idx] * b[idx];
-    }
-}
-
-// Element-wise add kernel
-static __global__ void add_kernel(const float* __restrict__ a,
-                           const float* __restrict__ b,
-                           float* __restrict__ c, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        c[idx] = a[idx] + b[idx];
-    }
-}
-
-// Add with scale kernel: c = a + scale * b
-static __global__ void add_scaled_kernel(const float* __restrict__ a,
-                                  const float* __restrict__ b,
-                                  float* __restrict__ c,
-                                  float scale, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        c[idx] = a[idx] + scale * b[idx];
-    }
-}
-
-// Embedding lookup kernel
-static __global__ void embedding_kernel(const float* __restrict__ embeddings,
-                                 const int* __restrict__ input_ids,
-                                 float* __restrict__ output,
-                                 int seq_len, int hidden_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = seq_len * hidden_size;
-
-    if (idx >= total) return;
-
-    int s = idx / hidden_size;
-    int d = idx % hidden_size;
-
-    int token_id = input_ids[s];
-    output[s * hidden_size + d] = embeddings[token_id * hidden_size + d];
-}
-
-// RoPE kernel
-static __global__ void rope_kernel(float* __restrict__ q,
-                            float* __restrict__ k,
-                            const float* __restrict__ cos,
-                            const float* __restrict__ sin,
-                            int batch, int num_q_heads, int num_kv_heads,
-                            int seq_len, int head_dim) {
-    int b = blockIdx.z;
-    int s = blockIdx.y;
-    int h = blockIdx.x;
-
-    int half_dim = head_dim / 2;
-
-    // Q heads
-    if (h < num_q_heads) {
-        for (int d = threadIdx.x; d < half_dim; d += blockDim.x) {
-            int idx = ((b * num_q_heads + h) * seq_len + s) * head_dim;
-            float q1 = q[idx + d];
-            float q2 = q[idx + d + half_dim];
-
-            float cos_val = cos[s * head_dim + d];
-            float sin_val = sin[s * head_dim + d];
-            float cos_val2 = cos[s * head_dim + d + half_dim];
-            float sin_val2 = sin[s * head_dim + d + half_dim];
-
-            q[idx + d] = q1 * cos_val - q2 * sin_val;
-            q[idx + d + half_dim] = q2 * cos_val2 + q1 * sin_val2;
-        }
-    }
-
-    // K heads (only if h < num_kv_heads)
-    if (h < num_kv_heads) {
-        for (int d = threadIdx.x; d < half_dim; d += blockDim.x) {
-            int idx = ((b * num_kv_heads + h) * seq_len + s) * head_dim;
-            float k1 = k[idx + d];
-            float k2 = k[idx + d + half_dim];
-
-            float cos_val = cos[s * head_dim + d];
-            float sin_val = sin[s * head_dim + d];
-            float cos_val2 = cos[s * head_dim + d + half_dim];
-            float sin_val2 = sin[s * head_dim + d + half_dim];
-
-            k[idx + d] = k1 * cos_val - k2 * sin_val;
-            k[idx + d + half_dim] = k2 * cos_val2 + k1 * sin_val2;
-        }
-    }
-}
-
-// Repeat KV for GQA
-static __global__ void repeat_kv_kernel(const float* __restrict__ kv,
-                                 float* __restrict__ kv_expanded,
-                                 int batch, int num_kv_heads, int seq_len,
-                                 int head_dim, int num_groups) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * num_kv_heads * seq_len * head_dim;
-
-    if (idx >= total) return;
-
-    int d = idx % head_dim;
-    int s = (idx / head_dim) % seq_len;
-    int h = (idx / (head_dim * seq_len)) % num_kv_heads;
-    int b = idx / (head_dim * seq_len * num_kv_heads);
-
-    float val = kv[idx];
-
-    for (int r = 0; r < num_groups; r++) {
-        int h_out = h * num_groups + r;
-        int idx_out = ((b * num_kv_heads * num_groups + h_out) * seq_len + s) * head_dim + d;
-        kv_expanded[idx_out] = val;
     }
 }
 
@@ -384,99 +226,6 @@ static __global__ void attention_output_kernel(const float* __restrict__ scores,
         sum += scores[i * seq_len + j] * V[j * head_dim + d];
     }
     output[i * head_dim + d] = sum;
-}
-
-// Transpose kernel (b,s,h,d) -> (b,h,s,d)
-static __global__ void transpose_bshd_to_bhsd_kernel(const float* __restrict__ input,
-                                              float* __restrict__ output,
-                                              int batch, int seq_len, int num_heads, int head_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * seq_len * num_heads * head_dim;
-
-    if (idx >= total) return;
-
-    int d = idx % head_dim;
-    int h = (idx / head_dim) % num_heads;
-    int s = (idx / (head_dim * num_heads)) % seq_len;
-    int b = idx / (head_dim * num_heads * seq_len);
-
-    int idx_out = ((b * num_heads + h) * seq_len + s) * head_dim + d;
-    output[idx_out] = input[idx];
-}
-
-// Transpose kernel (b,h,s,d) -> (b,s,h,d)
-static __global__ void transpose_bhsd_to_bshd_kernel(const float* __restrict__ input,
-                                              float* __restrict__ output,
-                                              int batch, int num_heads, int seq_len, int head_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * num_heads * seq_len * head_dim;
-
-    if (idx >= total) return;
-
-    int d = idx % head_dim;
-    int s = (idx / head_dim) % seq_len;
-    int h = (idx / (head_dim * seq_len)) % num_heads;
-    int b = idx / (head_dim * seq_len * num_heads);
-
-    int idx_out = ((b * seq_len + s) * num_heads + h) * head_dim + d;
-    output[idx_out] = input[idx];
-}
-
-// Causal Conv1D kernel
-static __global__ void causal_conv1d_kernel(const float* __restrict__ input,
-                                     const float* __restrict__ weight,
-                                     const float* __restrict__ bias,
-                                     float* __restrict__ output,
-                                     int batch, int channels, int seq_len,
-                                     int kernel_size, bool has_bias) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * channels * seq_len;
-
-    if (idx >= total) return;
-
-    int s = idx % seq_len;
-    int c = (idx / seq_len) % channels;
-    int b = idx / (seq_len * channels);
-
-    float sum = 0.0f;
-    for (int k = 0; k < kernel_size; k++) {
-        int input_pos = s - (kernel_size - 1) + k;
-        if (input_pos >= 0) {
-            sum += input[(b * channels + c) * seq_len + input_pos] * weight[c * kernel_size + k];
-        }
-    }
-
-    if (has_bias) sum += bias[c];
-    output[idx] = sum;
-}
-
-// Expert sigmoid + top-k routing kernel
-static __global__ void router_sigmoid_kernel(const float* __restrict__ logits,
-                                      float* __restrict__ routing_weights,
-                                      int num_tokens, int num_experts) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_tokens * num_experts) return;
-
-    float x = logits[idx];
-    routing_weights[idx] = 1.0f / (1.0f + expf(-x));
-}
-
-// Zero initialization kernel
-static __global__ void zero_kernel(float* __restrict__ data, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        data[idx] = 0.0f;
-    }
-}
-
-// Accumulate expert output with weight
-static __global__ void accumulate_expert_output_kernel(const float* __restrict__ expert_out,
-                                                float* __restrict__ output,
-                                                float weight, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        output[idx] += weight * expert_out[idx];
-    }
 }
 
 // ============================================================================
@@ -802,6 +551,7 @@ void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) 
     size_t seq_len = x.size(1);
     size_t hidden_size = x.size(2);
     size_t num_tokens = batch * seq_len;
+    size_t intermediate_size = MOE_INTERMEDIATE_SIZE;
 
     Tensor x_flat = x.view({num_tokens, hidden_size});
 
@@ -815,7 +565,12 @@ void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) 
     y = Tensor({batch, seq_len, hidden_size});
     y.zero();
 
-    // Group tokens by expert for batched processing
+    // =========================================================================
+    // OPTIMIZATION 1.1: Batched Multi-GPU Expert Processing
+    // =========================================================================
+
+    // Build token-to-expert assignment matrix for batch processing
+    // expert_tokens[e] = list of (token_idx, weight) pairs for expert e
     std::vector<std::vector<std::pair<size_t, float>>> expert_tokens(NUM_EXPERTS);
 
     for (size_t t = 0; t < num_tokens; t++) {
@@ -826,39 +581,116 @@ void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) 
         }
     }
 
-    cudaSetDevice(0);
+    // Get number of available GPUs
+    int device_count = 1;
+    cudaGetDeviceCount(&device_count);
+    int num_gpus = std::min(device_count, (int)NUM_GPUS);
 
-    // Process experts - each expert call handles GPU transfer internally
+    // Allocate output accumulator on CPU (thread-safe accumulation)
+    std::vector<float> y_accum(num_tokens * hidden_size, 0.0f);
+
+    // Process experts in parallel across multiple GPUs
+    // Each GPU processes a subset of experts concurrently
+    #pragma omp parallel for schedule(dynamic)
     for (size_t e = 0; e < NUM_EXPERTS; e++) {
         if (expert_tokens[e].empty()) continue;
 
+        // Assign expert to GPU based on expert index (round-robin)
+        int gpu_id = e % num_gpus;
+        cudaSetDevice(gpu_id);
+
         size_t batch_size = expert_tokens[e].size();
 
-        // Create batched input
-        Tensor batch_in({batch_size, 1, hidden_size});
+        // Allocate GPU memory for this expert batch
+        float *d_input, *d_output;
+        float *d_w1, *d_w2, *d_w3;
+        float *d_gate, *d_gate_silu, *d_up, *d_hidden;
+
+        cudaMalloc(&d_input, batch_size * hidden_size * sizeof(float));
+        cudaMalloc(&d_output, batch_size * hidden_size * sizeof(float));
+        cudaMalloc(&d_w1, intermediate_size * hidden_size * sizeof(float));
+        cudaMalloc(&d_w2, hidden_size * intermediate_size * sizeof(float));
+        cudaMalloc(&d_w3, intermediate_size * hidden_size * sizeof(float));
+        cudaMalloc(&d_gate, batch_size * intermediate_size * sizeof(float));
+        cudaMalloc(&d_gate_silu, batch_size * intermediate_size * sizeof(float));
+        cudaMalloc(&d_up, batch_size * intermediate_size * sizeof(float));
+        cudaMalloc(&d_hidden, batch_size * intermediate_size * sizeof(float));
+
+        // Create batched input tensor on CPU
+        std::vector<float> batch_in_data(batch_size * hidden_size);
         for (size_t i = 0; i < batch_size; i++) {
             size_t t = expert_tokens[e][i].first;
             for (size_t h = 0; h < hidden_size; h++) {
-                batch_in.at(i, 0, h) = x_flat.at(t, h);
+                batch_in_data[i * hidden_size + h] = x_flat.at(t, h);
             }
         }
 
-        // Run expert forward pass
-        Tensor batch_out({batch_size, 1, hidden_size});
-        experts_[e].forward(batch_in, batch_out);
+        // Upload input and weights to GPU
+        cudaMemcpy(d_input, batch_in_data.data(), batch_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_w1, experts_[e].w1().data(), intermediate_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_w2, experts_[e].w2().data(), hidden_size * intermediate_size * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_w3, experts_[e].w3().data(), intermediate_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
 
-        // Accumulate weighted outputs
+        // Run MLP forward pass on GPU
+        // gate = input @ w1^T
+        dim3 block(TILE_SIZE, TILE_SIZE);
+        dim3 grid_gate((intermediate_size + TILE_SIZE - 1) / TILE_SIZE,
+                       (batch_size + TILE_SIZE - 1) / TILE_SIZE);
+        matmul_kernel<<<grid_gate, block>>>(d_input, d_w1, d_gate, batch_size, intermediate_size, hidden_size);
+
+        // gate_silu = silu(gate)
+        int silu_blocks = (batch_size * intermediate_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        silu_kernel<<<silu_blocks, BLOCK_SIZE>>>(d_gate, d_gate_silu, batch_size * intermediate_size);
+
+        // up = input @ w3^T
+        matmul_kernel<<<grid_gate, block>>>(d_input, d_w3, d_up, batch_size, intermediate_size, hidden_size);
+
+        // hidden = gate_silu * up
+        mul_kernel<<<silu_blocks, BLOCK_SIZE>>>(d_gate_silu, d_up, d_hidden, batch_size * intermediate_size);
+
+        // output = hidden @ w2^T
+        dim3 grid_out((hidden_size + TILE_SIZE - 1) / TILE_SIZE,
+                      (batch_size + TILE_SIZE - 1) / TILE_SIZE);
+        matmul_kernel<<<grid_out, block>>>(d_hidden, d_w2, d_output, batch_size, hidden_size, intermediate_size);
+
+        // Download result
+        std::vector<float> batch_out_data(batch_size * hidden_size);
+        cudaMemcpy(batch_out_data.data(), d_output, batch_size * hidden_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free GPU memory
+        cudaFree(d_input);
+        cudaFree(d_output);
+        cudaFree(d_w1);
+        cudaFree(d_w2);
+        cudaFree(d_w3);
+        cudaFree(d_gate);
+        cudaFree(d_gate_silu);
+        cudaFree(d_up);
+        cudaFree(d_hidden);
+
+        // Accumulate weighted outputs (thread-safe with atomic or critical section)
         for (size_t i = 0; i < batch_size; i++) {
             size_t t = expert_tokens[e][i].first;
             float weight = expert_tokens[e][i].second;
-            size_t b = t / seq_len;
-            size_t s = t % seq_len;
 
             for (size_t h = 0; h < hidden_size; h++) {
-                y.at(b, s, h) += weight * batch_out.at(i, 0, h);
+                #pragma omp atomic
+                y_accum[t * hidden_size + h] += weight * batch_out_data[i * hidden_size + h];
             }
         }
     }
+
+    // Copy accumulated results to output tensor
+    for (size_t t = 0; t < num_tokens; t++) {
+        size_t b = t / seq_len;
+        size_t s = t % seq_len;
+        for (size_t h = 0; h < hidden_size; h++) {
+            y.at(b, s, h) = y_accum[t * hidden_size + h];
+        }
+    }
+
+    // Reset to default GPU
+    cudaSetDevice(0);
 }
 
 // Attention implementation
@@ -956,48 +788,75 @@ void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
     tensor_ops::repeat_kv(k, NUM_KEY_VALUE_GROUPS, k_repeated);
     tensor_ops::repeat_kv(v, NUM_KEY_VALUE_GROUPS, v_repeated);
 
-    // Compute attention
+    // =========================================================================
+    // OPTIMIZATION 1.2: GPU Attention Kernels
+    // Replace CPU attention loops with GPU kernel calls
+    // Uses attn_scores_kernel, causal_softmax_kernel, attn_output_kernel
+    // =========================================================================
+
     float scale = 1.0f / std::sqrt((float)HEAD_DIM);
     Tensor attn_output({batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM});
 
-    #pragma omp parallel for collapse(2)
+    // Allocate GPU memory for attention computation
+    size_t qkv_size = batch * NUM_ATTENTION_HEADS * seq_len * HEAD_DIM;
+    size_t scores_size = batch * NUM_ATTENTION_HEADS * seq_len * seq_len;
+
+    float *d_q, *d_k, *d_v, *d_scores, *d_attn_output;
+
+    cudaMalloc(&d_q, qkv_size * sizeof(float));
+    cudaMalloc(&d_k, qkv_size * sizeof(float));
+    cudaMalloc(&d_v, qkv_size * sizeof(float));
+    cudaMalloc(&d_scores, scores_size * sizeof(float));
+    cudaMalloc(&d_attn_output, qkv_size * sizeof(float));
+
+    // Upload Q, K, V to GPU (already in (batch, num_heads, seq_len, head_dim) format)
+    cudaMemcpy(d_q, q.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k_repeated.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v_repeated.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch attention kernels for all batches and heads
+    // Grid: (seq_len, batch * num_heads) for scores computation
+    // Each block handles one query position
+
+    // Compute attention scores: Q @ K^T with scaling
+    // Using the attention_scores_kernel from layer.cu interface
+    dim3 scores_grid(seq_len, batch * NUM_ATTENTION_HEADS);
+    dim3 scores_block(std::min((int)seq_len, 256));
+
+    // Process each (batch, head) pair
     for (size_t b = 0; b < batch; b++) {
         for (size_t h = 0; h < NUM_ATTENTION_HEADS; h++) {
-            // Compute Q @ K^T
-            Tensor scores({seq_len, seq_len});
-            for (size_t i = 0; i < seq_len; i++) {
-                for (size_t j = 0; j < seq_len; j++) {
-                    float sum = 0.0f;
-                    for (size_t d = 0; d < HEAD_DIM; d++) {
-                        sum += q.at(b, h, i, d) * k_repeated.at(b, h, j, d);
-                    }
-                    scores.at(i, j) = sum * scale;
-                }
-            }
+            size_t bh_offset = (b * NUM_ATTENTION_HEADS + h);
+            float* q_ptr = d_q + bh_offset * seq_len * HEAD_DIM;
+            float* k_ptr = d_k + bh_offset * seq_len * HEAD_DIM;
+            float* scores_ptr = d_scores + bh_offset * seq_len * seq_len;
+            float* v_ptr = d_v + bh_offset * seq_len * HEAD_DIM;
+            float* out_ptr = d_attn_output + bh_offset * seq_len * HEAD_DIM;
 
-            // Apply causal mask
-            for (size_t i = 0; i < seq_len; i++) {
-                for (size_t j = i + 1; j < seq_len; j++) {
-                    scores.at(i, j) = -INFINITY;
-                }
-            }
+            // Compute attention scores: scores[i,j] = sum_d Q[i,d] * K[j,d] * scale
+            dim3 attn_scores_grid(seq_len, seq_len);
+            attention_scores_kernel<<<attn_scores_grid, 32>>>(
+                q_ptr, k_ptr, scores_ptr, seq_len, HEAD_DIM, scale);
 
-            // Softmax
-            Tensor attn_weights({seq_len, seq_len});
-            tensor_ops::softmax(scores, attn_weights, -1);
+            // Apply causal mask and softmax
+            causal_softmax_kernel<<<seq_len, 32>>>(scores_ptr, seq_len);
 
-            // Multiply by V
-            for (size_t i = 0; i < seq_len; i++) {
-                for (size_t d = 0; d < HEAD_DIM; d++) {
-                    float sum = 0.0f;
-                    for (size_t j = 0; j < seq_len; j++) {
-                        sum += attn_weights.at(i, j) * v_repeated.at(b, h, j, d);
-                    }
-                    attn_output.at(b, h, i, d) = sum;
-                }
-            }
+            // Compute attention output: out[i,d] = sum_j scores[i,j] * V[j,d]
+            dim3 attn_out_grid((HEAD_DIM + 31) / 32, seq_len);
+            attention_output_kernel<<<attn_out_grid, 32>>>(
+                scores_ptr, v_ptr, out_ptr, seq_len, HEAD_DIM);
         }
     }
+
+    // Download attention output
+    cudaMemcpy(attn_output.data(), d_attn_output, qkv_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free GPU memory
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_scores);
+    cudaFree(d_attn_output);
 
     // Reshape and project output
     Tensor attn_flat({batch * seq_len, hidden_size});

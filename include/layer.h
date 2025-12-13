@@ -47,6 +47,11 @@ public:
 
     void forward(const Tensor& x, Tensor& y);
 
+    // Getters for weights (needed for batched multi-GPU MoE processing)
+    const Tensor& w1() const { return w1_; }
+    const Tensor& w2() const { return w2_; }
+    const Tensor& w3() const { return w3_; }
+
 private:
     Tensor w1_;  // up projection
     Tensor w3_;  // gate projection

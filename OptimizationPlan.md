@@ -20,8 +20,9 @@ Solution:
 Replace CPU attention loops with GPU kernel calls
 Use attention_score_kernel, causal_softmax_kernel, attention_output_kernel
 Keep Q, K, V tensors on GPU throughout attention computation
+
 Priority 2: High-Impact Optimizations (Expected 2-3× speedup)
-2.1 ShortConv Kernel Fusion — model.cu:1055-1145
+2.1 ShortConv Kernel Fusion
 Problem: 8 separate operations with CPU tensor manipulations
 Solution:
 Create fused CUDA kernel combining: in_proj → reshape → split → multiply → conv1d → multiply → transpose → out_proj
@@ -38,6 +39,7 @@ Solution:
 __global__ void embedding_lookup_kernel(
     const int* tokens, const float* embed_table, 
     float* output, int seq_len, int hidden_size);
+
 Priority 3: Medium-Impact Optimizations (Expected 1.5-2× speedup)
 3.1 RMSNorm GPU Implementation — Currently CPU fallback
 Problem: 48 normalization calls per forward pass on CPU
@@ -53,6 +55,7 @@ Solution:
 Use CUDA streams for async transfers
 Overlap computation with data transfer (double-buffering)
 Use pinned memory consistently (cudaMallocHost)
+
 Priority 4: Lower-Impact Optimizations
 4.1 MPI Weight Loading — main.cpp
 Single rank loads model, broadcast to others (reduces I/O contention)
