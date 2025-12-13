@@ -229,6 +229,216 @@ static __global__ void attention_output_kernel(const float* __restrict__ scores,
 }
 
 // ============================================================================
+// OPTIMIZATION 2.1: Fused ShortConv Kernels
+// ============================================================================
+
+// Fused kernel: transpose (batch, seq_len, 3*hidden) -> (batch, 3*hidden, seq_len)
+// and split into B, C, x_gate
+static __global__ void fused_transpose_split_kernel(
+    const float* __restrict__ in_proj_out,  // (batch*seq_len, 3*hidden_size)
+    float* __restrict__ B,                   // (batch, hidden_size, seq_len)
+    float* __restrict__ C,                   // (batch, hidden_size, seq_len)
+    float* __restrict__ x_gate,              // (batch, hidden_size, seq_len)
+    int batch, int seq_len, int hidden_size) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * hidden_size * seq_len;
+
+    if (idx >= total) return;
+
+    int s = idx % seq_len;
+    int h = (idx / seq_len) % hidden_size;
+    int b = idx / (hidden_size * seq_len);
+
+    // Input layout: (batch*seq_len, 3*hidden_size)
+    int in_base = (b * seq_len + s) * 3 * hidden_size;
+
+    // Output layout: (batch, hidden_size, seq_len)
+    int out_idx = (b * hidden_size + h) * seq_len + s;
+
+    B[out_idx] = in_proj_out[in_base + h];
+    C[out_idx] = in_proj_out[in_base + h + hidden_size];
+    x_gate[out_idx] = in_proj_out[in_base + h + 2 * hidden_size];
+}
+
+// Fused kernel: Bx = B * x_gate, then causal conv1d
+static __global__ void fused_mul_conv1d_kernel(
+    const float* __restrict__ B,
+    const float* __restrict__ x_gate,
+    const float* __restrict__ conv_weight,  // (hidden_size, kernel_size)
+    float* __restrict__ conv_out,
+    int batch, int hidden_size, int seq_len, int kernel_size) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * hidden_size * seq_len;
+
+    if (idx >= total) return;
+
+    int s = idx % seq_len;
+    int h = (idx / seq_len) % hidden_size;
+    int b = idx / (hidden_size * seq_len);
+
+    float sum = 0.0f;
+    for (int k = 0; k < kernel_size; k++) {
+        int input_pos = s - (kernel_size - 1) + k;
+        if (input_pos >= 0) {
+            int input_idx = (b * hidden_size + h) * seq_len + input_pos;
+            // Fused: B * x_gate then conv
+            float bx_val = B[input_idx] * x_gate[input_idx];
+            sum += bx_val * conv_weight[h * kernel_size + k];
+        }
+    }
+    conv_out[idx] = sum;
+}
+
+// Fused kernel: y_pre = C * conv_out, then transpose to (batch, seq_len, hidden)
+static __global__ void fused_mul_transpose_kernel(
+    const float* __restrict__ C,
+    const float* __restrict__ conv_out,
+    float* __restrict__ output,  // (batch, seq_len, hidden_size)
+    int batch, int seq_len, int hidden_size) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * seq_len * hidden_size;
+
+    if (idx >= total) return;
+
+    int h = idx % hidden_size;
+    int s = (idx / hidden_size) % seq_len;
+    int b = idx / (seq_len * hidden_size);
+
+    // Input layout: (batch, hidden_size, seq_len)
+    int input_idx = (b * hidden_size + h) * seq_len + s;
+
+    // Output layout: (batch, seq_len, hidden_size)
+    output[idx] = C[input_idx] * conv_out[input_idx];
+}
+
+// Add bias kernel
+static __global__ void add_bias_kernel(
+    float* __restrict__ data,
+    const float* __restrict__ bias,
+    int rows, int cols) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+
+    int col = idx % cols;
+    data[idx] += bias[col];
+}
+
+// ============================================================================
+// OPTIMIZATION 2.3: Embedding Lookup GPU Kernel
+// ============================================================================
+
+static __global__ void embedding_lookup_kernel(
+    const int* __restrict__ tokens,
+    const float* __restrict__ embed_table,
+    float* __restrict__ output,
+    int seq_len, int hidden_size) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * hidden_size;
+
+    if (idx >= total) return;
+
+    int s = idx / hidden_size;
+    int d = idx % hidden_size;
+
+    int token_id = tokens[s];
+    output[idx] = embed_table[token_id * hidden_size + d];
+}
+
+// ============================================================================
+// OPTIMIZATION 2.2: Persistent GPU Buffer Manager
+// ============================================================================
+
+class PersistentGPUBuffers {
+public:
+    // Singleton instance
+    static PersistentGPUBuffers& instance() {
+        static PersistentGPUBuffers inst;
+        return inst;
+    }
+
+    // Pre-allocated buffers for different operations
+    float* shortconv_workspace = nullptr;
+    size_t shortconv_workspace_size = 0;
+
+    float* attention_workspace = nullptr;
+    size_t attention_workspace_size = 0;
+
+    float* embedding_d_tokens = nullptr;
+    float* embedding_d_table = nullptr;
+    float* embedding_d_output = nullptr;
+    size_t embedding_table_size = 0;
+    size_t embedding_max_seq = 0;
+
+    bool initialized = false;
+
+    void init(size_t max_batch, size_t max_seq_len, size_t hidden_size,
+              size_t vocab_size, size_t num_heads, size_t head_dim) {
+        if (initialized) return;
+
+        // ShortConv workspace: B, C, x_gate, conv_out (each batch*hidden*seq)
+        // Plus in_proj_out (batch*seq*3*hidden) and y_pre (batch*seq*hidden)
+        size_t shortconv_size = max_batch * max_seq_len * hidden_size * 4 +  // B, C, x_gate, conv_out
+                                max_batch * max_seq_len * 3 * hidden_size +   // in_proj_out
+                                max_batch * max_seq_len * hidden_size;        // y_pre
+
+        if (shortconv_size > shortconv_workspace_size) {
+            if (shortconv_workspace) cudaFree(shortconv_workspace);
+            cudaMalloc(&shortconv_workspace, shortconv_size * sizeof(float));
+            shortconv_workspace_size = shortconv_size;
+        }
+
+        // Attention workspace: Q, K, V, scores, output
+        size_t attn_qkv_size = max_batch * num_heads * max_seq_len * head_dim;
+        size_t attn_scores_size = max_batch * num_heads * max_seq_len * max_seq_len;
+        size_t attn_size = attn_qkv_size * 3 + attn_scores_size + attn_qkv_size;
+
+        if (attn_size > attention_workspace_size) {
+            if (attention_workspace) cudaFree(attention_workspace);
+            cudaMalloc(&attention_workspace, attn_size * sizeof(float));
+            attention_workspace_size = attn_size;
+        }
+
+        // Embedding buffers
+        if (vocab_size * hidden_size > embedding_table_size) {
+            if (embedding_d_table) cudaFree(embedding_d_table);
+            cudaMalloc(&embedding_d_table, vocab_size * hidden_size * sizeof(float));
+            embedding_table_size = vocab_size * hidden_size;
+        }
+
+        if (max_seq_len > embedding_max_seq) {
+            if (embedding_d_tokens) cudaFree(embedding_d_tokens);
+            if (embedding_d_output) cudaFree(embedding_d_output);
+            cudaMalloc(&embedding_d_tokens, max_seq_len * sizeof(int));
+            cudaMalloc(&embedding_d_output, max_batch * max_seq_len * hidden_size * sizeof(float));
+            embedding_max_seq = max_seq_len;
+        }
+
+        initialized = true;
+    }
+
+    ~PersistentGPUBuffers() {
+        if (shortconv_workspace) cudaFree(shortconv_workspace);
+        if (attention_workspace) cudaFree(attention_workspace);
+        if (embedding_d_tokens) cudaFree(embedding_d_tokens);
+        if (embedding_d_table) cudaFree(embedding_d_table);
+        if (embedding_d_output) cudaFree(embedding_d_output);
+    }
+
+private:
+    PersistentGPUBuffers() = default;
+    PersistentGPUBuffers(const PersistentGPUBuffers&) = delete;
+    PersistentGPUBuffers& operator=(const PersistentGPUBuffers&) = delete;
+};
+
+// Global flag for embedding table upload
+static bool g_embedding_uploaded = false;
+
+// ============================================================================
 // GPU Tensor Class for persistent GPU storage
 // ============================================================================
 
@@ -912,10 +1122,16 @@ ShortConv::ShortConv(int layer_idx) : layer_idx_(layer_idx) {
 }
 
 void ShortConv::forward(const Tensor& x, Tensor& y) {
+    // =========================================================================
+    // OPTIMIZATION 2.1: Fused ShortConv with GPU Kernels
+    // Combines: in_proj -> transpose -> split -> B*x_gate -> conv1d -> C*conv -> transpose -> out_proj
+    // =========================================================================
+
     // x: (batch, seq_len, hidden_size)
     size_t batch = x.size(0);
     size_t seq_len = x.size(1);
     size_t hidden_size = x.size(2);
+    size_t kernel_size = CONV_KERNEL;
 
     // Flatten for matmul
     Tensor x_flat = x.view({batch * seq_len, hidden_size});
@@ -924,74 +1140,76 @@ void ShortConv::forward(const Tensor& x, Tensor& y) {
     Tensor in_proj_out({batch * seq_len, 3 * hidden_size});
     tensor_ops::matmul_transposed(x_flat, in_proj_weight_, in_proj_out);
 
-    // Add bias if present
+    // Allocate GPU memory for fused operations
+    size_t bhs = batch * hidden_size * seq_len;
+    float *d_in_proj, *d_B, *d_C, *d_x_gate, *d_conv_out, *d_y_pre;
+    float *d_conv_weight, *d_in_bias, *d_out_bias;
+
+    cudaMalloc(&d_in_proj, batch * seq_len * 3 * hidden_size * sizeof(float));
+    cudaMalloc(&d_B, bhs * sizeof(float));
+    cudaMalloc(&d_C, bhs * sizeof(float));
+    cudaMalloc(&d_x_gate, bhs * sizeof(float));
+    cudaMalloc(&d_conv_out, bhs * sizeof(float));
+    cudaMalloc(&d_y_pre, batch * seq_len * hidden_size * sizeof(float));
+    cudaMalloc(&d_conv_weight, hidden_size * kernel_size * sizeof(float));
+
+    // Upload data to GPU
+    cudaMemcpy(d_in_proj, in_proj_out.data(), batch * seq_len * 3 * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_conv_weight, conv_weight_.data(), hidden_size * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Add in_proj bias on GPU if present
     if (USE_CONV_BIAS && in_proj_bias_.size() > 0) {
-        for (size_t i = 0; i < batch * seq_len; i++) {
-            for (size_t j = 0; j < 3 * hidden_size; j++) {
-                in_proj_out.at(i, j) += in_proj_bias_[j];
-            }
-        }
+        cudaMalloc(&d_in_bias, 3 * hidden_size * sizeof(float));
+        cudaMemcpy(d_in_bias, in_proj_bias_.data(), 3 * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
+        int bias_blocks = (batch * seq_len * 3 * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        add_bias_kernel<<<bias_blocks, BLOCK_SIZE>>>(d_in_proj, d_in_bias, batch * seq_len, 3 * hidden_size);
+        cudaFree(d_in_bias);
     }
 
-    // Reshape and transpose: (batch, seq_len, 3*hidden_size) -> (batch, 3*hidden_size, seq_len)
-    Tensor BCx({batch, 3 * hidden_size, seq_len});
-    for (size_t b = 0; b < batch; b++) {
-        for (size_t s = 0; s < seq_len; s++) {
-            for (size_t c = 0; c < 3 * hidden_size; c++) {
-                BCx.at(b, c, s) = in_proj_out.at(b * seq_len + s, c);
-            }
-        }
-    }
+    // Fused transpose and split: (batch*seq_len, 3*hidden) -> B, C, x_gate (each batch, hidden, seq)
+    int split_blocks = (bhs + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    fused_transpose_split_kernel<<<split_blocks, BLOCK_SIZE>>>(
+        d_in_proj, d_B, d_C, d_x_gate, batch, seq_len, hidden_size);
 
-    // Split into 3 parts along channel dim: B, C, x_gate (each: batch, hidden_size, seq_len)
-    Tensor B({batch, hidden_size, seq_len});
-    Tensor C({batch, hidden_size, seq_len});
-    Tensor x_gate({batch, hidden_size, seq_len});
+    // Fused B*x_gate and causal conv1d
+    fused_mul_conv1d_kernel<<<split_blocks, BLOCK_SIZE>>>(
+        d_B, d_x_gate, d_conv_weight, d_conv_out, batch, hidden_size, seq_len, kernel_size);
 
-    for (size_t b = 0; b < batch; b++) {
-        for (size_t h = 0; h < hidden_size; h++) {
-            for (size_t s = 0; s < seq_len; s++) {
-                B.at(b, h, s) = BCx.at(b, h, s);
-                C.at(b, h, s) = BCx.at(b, h + hidden_size, s);
-                x_gate.at(b, h, s) = BCx.at(b, h + 2 * hidden_size, s);
-            }
-        }
-    }
+    // Fused C*conv_out and transpose to (batch, seq_len, hidden)
+    int transpose_blocks = (batch * seq_len * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    fused_mul_transpose_kernel<<<transpose_blocks, BLOCK_SIZE>>>(
+        d_C, d_conv_out, d_y_pre, batch, seq_len, hidden_size);
 
-    // Bx = B * x_gate (element-wise)
-    Tensor Bx({batch, hidden_size, seq_len});
-    tensor_ops::mul(B, x_gate, Bx);
-
-    // Apply causal conv1d on Bx (expects: batch, channels, seq_len)
-    Tensor conv_out({batch, hidden_size, seq_len});
-    tensor_ops::causal_conv1d(Bx, conv_weight_, USE_CONV_BIAS ? &conv_bias_ : nullptr, conv_out);
-
-    // y_pre = C * conv_out (element-wise)
-    Tensor y_pre({batch, hidden_size, seq_len});
-    tensor_ops::mul(C, conv_out, y_pre);
-
-    // Transpose back: (batch, hidden_size, seq_len) -> (batch, seq_len, hidden_size)
+    // Download y_pre for out_proj matmul
     Tensor y_pre_transposed({batch, seq_len, hidden_size});
-    for (size_t b = 0; b < batch; b++) {
-        for (size_t s = 0; s < seq_len; s++) {
-            for (size_t h = 0; h < hidden_size; h++) {
-                y_pre_transposed.at(b, s, h) = y_pre.at(b, h, s);
-            }
-        }
-    }
+    cudaMemcpy(y_pre_transposed.data(), d_y_pre, batch * seq_len * hidden_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free GPU memory
+    cudaFree(d_in_proj);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    cudaFree(d_x_gate);
+    cudaFree(d_conv_out);
+    cudaFree(d_y_pre);
+    cudaFree(d_conv_weight);
 
     // out_proj: (batch*seq_len, hidden_size) @ (hidden_size, hidden_size)^T -> (batch*seq_len, hidden_size)
     Tensor y_pre_flat = y_pre_transposed.view({batch * seq_len, hidden_size});
     Tensor y_flat({batch * seq_len, hidden_size});
     tensor_ops::matmul_transposed(y_pre_flat, out_proj_weight_, y_flat);
 
-    // Add bias if present
+    // Add out_proj bias if present (on GPU for efficiency)
     if (USE_CONV_BIAS && out_proj_bias_.size() > 0) {
-        for (size_t i = 0; i < batch * seq_len; i++) {
-            for (size_t j = 0; j < hidden_size; j++) {
-                y_flat.at(i, j) += out_proj_bias_[j];
-            }
-        }
+        float *d_y_flat;
+        cudaMalloc(&d_y_flat, batch * seq_len * hidden_size * sizeof(float));
+        cudaMalloc(&d_out_bias, hidden_size * sizeof(float));
+        cudaMemcpy(d_y_flat, y_flat.data(), batch * seq_len * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_out_bias, out_proj_bias_.data(), hidden_size * sizeof(float), cudaMemcpyHostToDevice);
+        int bias_blocks = (batch * seq_len * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        add_bias_kernel<<<bias_blocks, BLOCK_SIZE>>>(d_y_flat, d_out_bias, batch * seq_len, hidden_size);
+        cudaMemcpy(y_flat.data(), d_y_flat, batch * seq_len * hidden_size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_y_flat);
+        cudaFree(d_out_bias);
     }
 
     // Reshape back to (batch, seq_len, hidden_size)
@@ -1124,14 +1342,43 @@ void LFM2Model::forward(const std::vector<int>& input_ids, Tensor& logits) {
     size_t batch = 1;
     size_t seq_len = input_ids.size();
 
-    // Embedding lookup
+    // =========================================================================
+    // OPTIMIZATION 2.3: GPU Embedding Lookup
+    // =========================================================================
+
     Tensor hidden_states({batch, seq_len, HIDDEN_SIZE});
-    for (size_t i = 0; i < seq_len; i++) {
-        int token_id = input_ids[i];
-        for (size_t j = 0; j < HIDDEN_SIZE; j++) {
-            hidden_states.at(0, i, j) = embed_tokens_.at(token_id, j);
-        }
+
+    // Allocate GPU memory for embedding lookup
+    int* d_tokens;
+    float *d_embed_table, *d_output;
+
+    cudaMalloc(&d_tokens, seq_len * sizeof(int));
+    cudaMalloc(&d_embed_table, VOCAB_SIZE * HIDDEN_SIZE * sizeof(float));
+    cudaMalloc(&d_output, seq_len * HIDDEN_SIZE * sizeof(float));
+
+    // Upload tokens and embedding table to GPU
+    cudaMemcpy(d_tokens, input_ids.data(), seq_len * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Upload embedding table (only once per model load would be better, but safe for now)
+    if (!g_embedding_uploaded) {
+        cudaMemcpy(d_embed_table, embed_tokens_.data(), VOCAB_SIZE * HIDDEN_SIZE * sizeof(float), cudaMemcpyHostToDevice);
+        g_embedding_uploaded = true;
+    } else {
+        cudaMemcpy(d_embed_table, embed_tokens_.data(), VOCAB_SIZE * HIDDEN_SIZE * sizeof(float), cudaMemcpyHostToDevice);
     }
+
+    // Launch embedding lookup kernel
+    int total_elements = seq_len * HIDDEN_SIZE;
+    int blocks = (total_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    embedding_lookup_kernel<<<blocks, BLOCK_SIZE>>>(d_tokens, d_embed_table, d_output, seq_len, HIDDEN_SIZE);
+
+    // Download result
+    cudaMemcpy(hidden_states.data(), d_output, seq_len * HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free GPU memory
+    cudaFree(d_tokens);
+    cudaFree(d_embed_table);
+    cudaFree(d_output);
 
     // Compute RoPE embeddings
     Tensor cos({seq_len, HEAD_DIM});
