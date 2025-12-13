@@ -126,7 +126,7 @@ static __global__ void silu_kernel(const float* __restrict__ input,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         float x = input[idx];
-        output[idx] = x / (1.0f + expf(-x));
+        output[idx] = x * (1.0f / (1.0f + expf(-x)));
     }
 }
 
@@ -206,8 +206,9 @@ static __global__ void causal_softmax_kernel(float* __restrict__ scores,
     sum = shared_sum;
 
     // Normalize
+    float sum_inv = 1.0f / sum;
     for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
-        row[j] = (j <= i) ? (row[j] / sum) : 0.0f;
+        row[j] = (j <= i) ? (row[j] * sum_inv) : 0.0f;
     }
 }
 
@@ -823,7 +824,7 @@ void SparseMoeBlock::route_tokens(const Tensor& router_logits,
         std::vector<float> routing_weights(NUM_EXPERTS);
         for (size_t e = 0; e < NUM_EXPERTS; e++) {
             float logit = router_logits.at(t, e);
-            routing_weights[e] = 1.0f / (1.0f + std::exp(-logit));
+            routing_weights[e] = 1.0f * (1.0f / (1.0f + std::exp(-logit)));
         }
 
         std::vector<std::pair<float, int>> scores(NUM_EXPERTS);
@@ -1113,7 +1114,7 @@ void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
     // Uses attn_scores_kernel, causal_softmax_kernel, attn_output_kernel
     // =========================================================================
 
-    float scale = 1.0f / std::sqrt((float)HEAD_DIM);
+    float scale = 1.0f * (1.0f / std::sqrt((float)HEAD_DIM));
     Tensor attn_output({batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM});
 
     // Allocate GPU memory for attention computation

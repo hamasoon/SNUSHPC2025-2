@@ -102,15 +102,16 @@ __global__ void rms_norm_kernel(const float* __restrict__ input,
         }
     }
 
-    __shared__ float rms;
+    __shared__ float rms_inv;
     if (threadIdx.x == 0) {
-        rms = sqrtf(sum_sq / hidden_size + eps);
+        float rms = sqrtf(sum_sq * (1.0f / hidden_size) + eps);
+        rms_inv = 1.0f / rms;
     }
     __syncthreads();
 
     // Normalize and apply weight
     for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        out_ptr[d] = (in_ptr[d] / rms) * weight[d];
+        out_ptr[d] = (in_ptr[d] * rms_inv) * weight[d];
     }
 }
 
@@ -120,7 +121,7 @@ __global__ void silu_kernel(const float* __restrict__ input,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         float x = input[idx];
-        output[idx] = x / (1.0f + expf(-x));
+        output[idx] = x * (1.0f / (1.0f + expf(-x)));
     }
 }
 
@@ -187,8 +188,9 @@ __global__ void softmax_kernel(float* __restrict__ data,
     sum = shared_sum;
 
     // Normalize
+    float sum_inv = 1.0f / sum;
     for (int j = threadIdx.x; j < inner_size; j += blockDim.x) {
-        row[j] /= sum;
+        row[j] *= sum_inv;
     }
 }
 
@@ -320,8 +322,9 @@ __global__ void causal_softmax_kernel(float* __restrict__ scores,
     sum = shared_sum;
 
     // Normalize and apply causal mask
+    float sum_inv = 1.0f / sum;
     for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
-        scores[offset + j] = (j <= i) ? (scores[offset + j] / sum) : 0.0f;
+        scores[offset + j] = (j <= i) ? (scores[offset + j] * sum_inv) : 0.0f;
     }
 }
 
@@ -582,14 +585,14 @@ void mul_scalar(const Tensor& a, float b, Tensor& c) {
 void sigmoid(const Tensor& x, Tensor& y) {
     #pragma omp parallel for
     for (size_t i = 0; i < x.size(); i++) {
-        y[i] = 1.0f / (1.0f + std::exp(-x[i]));
+        y[i] = 1.0f * (1.0f / (1.0f + std::exp(-x[i])));
     }
 }
 
 void silu(const Tensor& x, Tensor& y) {
     #pragma omp parallel for
     for (size_t i = 0; i < x.size(); i++) {
-        y[i] = x[i] / (1.0f + std::exp(-x[i]));
+        y[i] = x[i] * (1.0f / (1.0f + std::exp(-x[i])));
     }
 }
 
@@ -613,8 +616,9 @@ void softmax(const Tensor& x, Tensor& y, int dim) {
             sum += y[i * inner_size + j];
         }
 
+        float sum_inv = 1.0f / sum;
         for (size_t j = 0; j < inner_size; j++) {
-            y[i * inner_size + j] /= sum;
+            y[i * inner_size + j] *= sum_inv;
         }
     }
 }
@@ -661,8 +665,9 @@ void rms_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& y) {
 void compute_rope_embeddings(size_t head_dim, size_t max_seq_len, float theta,
                              Tensor& cos, Tensor& sin) {
     std::vector<float> inv_freq(head_dim / 2);
+    float head_dim_inv = 1.0f / head_dim;
     for (size_t i = 0; i < head_dim / 2; i++) {
-        inv_freq[i] = 1.0f / std::pow(theta, (float)(2 * i) / head_dim);
+        inv_freq[i] = 1.0f * (1.0f / std::pow(theta, (float)(2 * i) * head_dim_inv));
     }
 
     #pragma omp parallel for
