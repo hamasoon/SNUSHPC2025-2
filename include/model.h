@@ -45,9 +45,14 @@ extern ParallelContext g_parallel_ctx;
 class LFM2Model {
 public:
     LFM2Model(const std::string& model_file);
-    
-    // Forward pass
+
+    // Forward pass (single sample)
     void forward(const std::vector<int>& input_ids, Tensor& logits);
+
+    // Batched forward pass (multiple samples)
+    // input_ids: flattened array of [batch_size * seq_len]
+    // logits: output tensor of shape [batch_size, vocab_size]
+    void forward_batch(const int* input_ids, size_t batch_size, size_t seq_len, Tensor& logits);
     
 private:
     std::unique_ptr<ModelLoader> loader_;

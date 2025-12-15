@@ -320,12 +320,45 @@ __global__ void split_bcx_kernel(const float* bcx, float* B, float* C, float* x_
     }
 }
 
-// Copy last token kernel
+// Copy last token kernel (single batch)
 __global__ void copy_last_token_kernel(const float* input, float* output,
                                         size_t seq_len, size_t hidden_size) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < hidden_size) {
         output[idx] = input[(seq_len - 1) * hidden_size + idx];
+    }
+}
+
+// Copy last token kernel (batched version)
+// input: [batch, seq_len, hidden_size]
+// output: [batch, hidden_size]
+__global__ void copy_last_token_batched_kernel(const float* input, float* output,
+                                                size_t batch_size, size_t seq_len, size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch_size * hidden_size;
+
+    if (idx < total) {
+        size_t b = idx / hidden_size;
+        size_t d = idx % hidden_size;
+        // Last token of each batch: input[b, seq_len-1, d]
+        output[idx] = input[(b * seq_len + (seq_len - 1)) * hidden_size + d];
+    }
+}
+
+// Batched embedding lookup kernel
+// input_ids: [batch_size * seq_len]
+// output: [batch_size, seq_len, hidden_size]
+__global__ void embedding_lookup_batched_kernel(const float* embed_table, const int* input_ids,
+                                                 float* output, size_t batch_size, size_t seq_len,
+                                                 size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch_size * seq_len * hidden_size;
+
+    if (idx < total) {
+        size_t d = idx % hidden_size;
+        size_t pos = idx / hidden_size;  // position in [batch_size * seq_len]
+        int token_id = input_ids[pos];
+        output[idx] = embed_table[token_id * hidden_size + d];
     }
 }
 
@@ -1143,4 +1176,53 @@ void LFM2Model::forward(const std::vector<int>& input_ids, Tensor& logits) {
     Tensor last_hidden_flat = last_hidden.view({batch, HIDDEN_SIZE});
     logits = Tensor({batch, VOCAB_SIZE});
     tensor_ops::matmul_transposed(last_hidden_flat, lm_head_, logits);
+}
+
+void LFM2Model::forward_batch(const int* input_ids, size_t batch_size, size_t seq_len, Tensor& logits) {
+    // Allocate and copy input_ids to GPU
+    int* d_input_ids;
+    size_t input_size = batch_size * seq_len;
+    CHECK_CUDA(cudaMalloc(&d_input_ids, input_size * sizeof(int)));
+    CHECK_CUDA(cudaMemcpy(d_input_ids, input_ids, input_size * sizeof(int), cudaMemcpyHostToDevice));
+
+    // Embedding lookup: [batch_size, seq_len, hidden_size]
+    Tensor hidden_states({batch_size, seq_len, HIDDEN_SIZE});
+    size_t total_embed = batch_size * seq_len * HIDDEN_SIZE;
+    int blocks_embed = (total_embed + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    embedding_lookup_batched_kernel<<<blocks_embed, BLOCK_SIZE>>>(
+        embed_tokens_.data(), d_input_ids, hidden_states.data(),
+        batch_size, seq_len, HIDDEN_SIZE);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaFree(d_input_ids));
+
+    // Compute RoPE embeddings (same for all batches, depends only on seq_len)
+    Tensor cos({seq_len, HEAD_DIM});
+    Tensor sin({seq_len, HEAD_DIM});
+    rotary_emb_->forward(seq_len, cos, sin);
+
+    Tensor* attention_mask = nullptr;
+
+    // Process through all layers
+    for (size_t i = 0; i < NUM_HIDDEN_LAYERS; i++) {
+        Tensor output({batch_size, seq_len, HIDDEN_SIZE});
+        layers_[i]->forward(hidden_states, cos, sin, attention_mask, output);
+        hidden_states = std::move(output);
+    }
+
+    // Final normalization
+    Tensor normed_output({batch_size, seq_len, HIDDEN_SIZE});
+    norm_->forward(hidden_states, normed_output);
+
+    // Extract last token from each batch: [batch_size, hidden_size]
+    Tensor last_hidden({batch_size, HIDDEN_SIZE});
+    size_t total_last = batch_size * HIDDEN_SIZE;
+    int blocks_last = (total_last + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    copy_last_token_batched_kernel<<<blocks_last, BLOCK_SIZE>>>(
+        normed_output.data(), last_hidden.data(),
+        batch_size, seq_len, HIDDEN_SIZE);
+    CHECK_CUDA(cudaGetLastError());
+
+    // LM head projection: [batch_size, hidden_size] @ [vocab_size, hidden_size]^T -> [batch_size, vocab_size]
+    logits = Tensor({batch_size, VOCAB_SIZE});
+    tensor_ops::matmul_transposed(last_hidden, lm_head_, logits);
 }

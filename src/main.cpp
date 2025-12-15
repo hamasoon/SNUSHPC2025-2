@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 static int num_samples = 1;
+static int batch_size = 1;  // Number of samples to process in parallel
 static bool run_validation = false;
 static bool run_warmup = false;
 
@@ -51,9 +52,10 @@ void print_help() {
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   if (mpi_rank == 0) {
     fprintf(stdout,
-            " Usage: ./main  [-n 'num_samples'] [-v] [-w] [-h]\n");
+            " Usage: ./main  [-n 'num_samples'] [-b 'batch_size'] [-v] [-w] [-h]\n");
     fprintf(stdout, " Options:\n");
     fprintf(stdout, "  -n: Number of input samples (default: 1)\n");
+    fprintf(stdout, "  -b: Batch size for parallel processing (default: 1)\n");
     fprintf(stdout, "  -v: Enable validation (default: OFF)\n");
     fprintf(stdout, "  -w: Enable warm-up (default: OFF)\n");
     fprintf(stdout, "  -h: Print manual and options (default: OFF)\n");
@@ -62,9 +64,10 @@ void print_help() {
 
 void parse_args(int argc, char **argv) {
   int args;
-  while ((args = getopt(argc, argv, "n:vwh")) != -1) {
+  while ((args = getopt(argc, argv, "n:b:vwh")) != -1) {
     switch (args) {
       case 'n': num_samples = atoi(optarg); break;
+      case 'b': batch_size = atoi(optarg); break;
       case 'v': run_validation = true; break;
       case 'w': run_warmup = true; break;
       case 'h':
@@ -77,7 +80,7 @@ void parse_args(int argc, char **argv) {
         break;
     }
   }
-  
+
   int mpi_rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   if (mpi_rank == 0) {
@@ -87,6 +90,7 @@ void parse_args(int argc, char **argv) {
     fprintf(stdout, " Validation: %s\n", run_validation ? "ON" : "OFF");
     fprintf(stdout, " Warm-up: %s\n", run_warmup ? "ON" : "OFF");
     fprintf(stdout, " Number of samples: %d\n", num_samples);
+    fprintf(stdout, " Batch size: %d\n", batch_size);
     fprintf(stdout, "=============================================\n\n");
   }
 }
@@ -164,9 +168,10 @@ int main(int argc, char* argv[]) {
         CHECK_CUDA(cudaMallocHost(&outputs, num_samples * VOCAB_SIZE * sizeof(float)));
     }
 
-    // Broadcast seq_length to all processes (needed for input allocation)
+    // Broadcast seq_length and batch_size to all processes (needed for input allocation)
     MPI_Bcast(&seq_length, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&num_samples, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&batch_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     // All non-zero ranks allocate input buffer for receiving broadcasts
     if (mpi_rank != 0) {
@@ -227,23 +232,27 @@ int main(int argc, char* argv[]) {
         CHECK_CUDA(cudaMallocHost(&local_outputs, local_num_samples * VOCAB_SIZE * sizeof(float)));
     }
 
-    // Process samples assigned to this node
-    // All GPUs in the node work together on each sample (expert parallelism)
-    for (int sample_idx = my_node_start; sample_idx < my_node_end; sample_idx++) {
-        // Each process has all inputs (from upfront broadcast), access directly
-        std::vector<int> input_ids_vec(inputs + sample_idx * seq_length,
-                                       inputs + (sample_idx + 1) * seq_length);
+    // Process samples assigned to this node in batches
+    // All GPUs in the node work together on each batch (expert parallelism)
+    for (int batch_start = my_node_start; batch_start < my_node_end; batch_start += batch_size) {
+        // Calculate actual batch size for this iteration (may be smaller at the end)
+        int current_batch_size = std::min(batch_size, my_node_end - batch_start);
+
+        // Get pointer to input data for this batch
+        const int* batch_inputs = inputs + batch_start * seq_length;
 
         // All GPUs run forward pass together (expert parallelism via MPI_Allreduce in MoE)
         Tensor logits;
-        model.forward(input_ids_vec, logits);
+        model.forward_batch(batch_inputs, current_batch_size, seq_length, logits);
 
         // Only local_rank 0 of each node stores the output
         if (g_parallel_ctx.local_rank == 0) {
-            int local_sample_idx = sample_idx - my_node_start;
             logits.sync_to_host();
-            for (size_t i = 0; i < VOCAB_SIZE; i++) {
-                local_outputs[local_sample_idx * VOCAB_SIZE + i] = logits.at(0, i);
+            for (int b = 0; b < current_batch_size; b++) {
+                int local_sample_idx = (batch_start - my_node_start) + b;
+                for (size_t i = 0; i < VOCAB_SIZE; i++) {
+                    local_outputs[local_sample_idx * VOCAB_SIZE + i] = logits.at(b, i);
+                }
             }
         }
     }
