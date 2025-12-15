@@ -14,6 +14,19 @@
 #define BLOCK_SIZE 256
 #define TILE_SIZE 16
 
+// Optimized matmul configuration
+// BM, BN: Block tile size for M and N dimensions
+// BK: Block tile size for K dimension
+// TM, TN: Register tile size per thread (each thread computes TM x TN elements)
+#define BM 128
+#define BN 128
+#define BK 8
+#define TM 8
+#define TN 8
+
+// Warp configuration
+#define WARP_SIZE 32
+
 // ============================================================================
 // Element-wise operation kernels
 // ============================================================================
@@ -78,7 +91,27 @@ __global__ void silu_mul_kernel(const float* gate, const float* up, float* y, si
 }
 
 // ============================================================================
-// Softmax kernel (optimized with shared memory)
+// Warp-level reduction utilities
+// ============================================================================
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// ============================================================================
+// Softmax kernel (optimized with warp-level reduction)
 // ============================================================================
 
 __global__ void softmax_kernel(const float* x, float* y, size_t outer_size, size_t inner_size) {
@@ -90,55 +123,73 @@ __global__ void softmax_kernel(const float* x, float* y, size_t outer_size, size
     const float* x_row = x + row * inner_size;
     float* y_row = y + row * inner_size;
 
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
+
     // Find max for numerical stability
     float max_val = -INFINITY;
-    for (size_t i = threadIdx.x; i < inner_size; i += blockDim.x) {
+    for (size_t i = tid; i < inner_size; i += blockDim.x) {
         max_val = fmaxf(max_val, x_row[i]);
     }
 
-    // Reduce to find global max
-    shared[threadIdx.x] = max_val;
+    // Warp-level reduction for max
+    max_val = warp_reduce_max(max_val);
+
+    // Store warp results in shared memory
+    if (lane_id == 0) {
+        shared[warp_id] = max_val;
+    }
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + s]);
+    // First warp reduces across all warps
+    if (warp_id == 0) {
+        max_val = (lane_id < num_warps) ? shared[lane_id] : -INFINITY;
+        max_val = warp_reduce_max(max_val);
+        if (lane_id == 0) {
+            shared[0] = max_val;
         }
-        __syncthreads();
     }
-    max_val = shared[0];
     __syncthreads();
+    max_val = shared[0];
 
     // Compute exp and sum
     float sum = 0.0f;
-    for (size_t i = threadIdx.x; i < inner_size; i += blockDim.x) {
+    for (size_t i = tid; i < inner_size; i += blockDim.x) {
         float exp_val = expf(x_row[i] - max_val);
         y_row[i] = exp_val;
         sum += exp_val;
     }
 
-    // Reduce to find global sum
-    shared[threadIdx.x] = sum;
+    // Warp-level reduction for sum
+    sum = warp_reduce_sum(sum);
+
+    if (lane_id == 0) {
+        shared[warp_id] = sum;
+    }
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] += shared[threadIdx.x + s];
+    // First warp reduces across all warps
+    if (warp_id == 0) {
+        sum = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (lane_id == 0) {
+            shared[0] = sum;
         }
-        __syncthreads();
     }
-    sum = shared[0];
     __syncthreads();
+    sum = shared[0];
 
     // Normalize
     float inv_sum = 1.0f / sum;
-    for (size_t i = threadIdx.x; i < inner_size; i += blockDim.x) {
+    for (size_t i = tid; i < inner_size; i += blockDim.x) {
         y_row[i] *= inv_sum;
     }
 }
 
 // ============================================================================
-// RMSNorm kernel
+// RMSNorm kernel (optimized with warp-level reduction)
 // ============================================================================
 
 __global__ void rms_norm_kernel(const float* x, const float* weight, float eps, float* y,
@@ -151,29 +202,40 @@ __global__ void rms_norm_kernel(const float* x, const float* weight, float eps, 
     const float* x_row = x + row * hidden_size;
     float* y_row = y + row * hidden_size;
 
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
+
     // Compute sum of squares
     float sum_sq = 0.0f;
-    for (size_t i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+    for (size_t i = tid; i < hidden_size; i += blockDim.x) {
         float val = x_row[i];
         sum_sq += val * val;
     }
 
-    // Reduce sum
-    shared[threadIdx.x] = sum_sq;
+    // Warp-level reduction
+    sum_sq = warp_reduce_sum(sum_sq);
+
+    if (lane_id == 0) {
+        shared[warp_id] = sum_sq;
+    }
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] += shared[threadIdx.x + s];
+    // First warp reduces across all warps
+    if (warp_id == 0) {
+        sum_sq = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        sum_sq = warp_reduce_sum(sum_sq);
+        if (lane_id == 0) {
+            shared[0] = sum_sq;
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     float rms = 1.0f / sqrtf(shared[0] * inv_hidden_size + eps);
-    __syncthreads();
 
     // Normalize and scale
-    for (size_t i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+    for (size_t i = tid; i < hidden_size; i += blockDim.x) {
         y_row[i] = x_row[i] * rms * weight[i];
     }
 }
@@ -182,10 +244,180 @@ __global__ void rms_norm_kernel(const float* x, const float* weight, float eps, 
 // Matrix multiplication kernels
 // ============================================================================
 
-// Basic matmul: c = a @ b
+// Optimized matmul kernel with:
+// 1. Register Tiling: Each thread computes TM x TN output elements
+// 2. Double Buffering: Overlap shared memory loads with computation
+// 3. Warp-level parallelism: Coalesced memory access patterns
 // a: (m, k), b: (k, n), c: (m, n)
-__global__ void matmul_kernel(const float* a, const float* b, float* c,
-                               size_t m, size_t k, size_t n) {
+__global__ void matmul_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                               float* __restrict__ c, size_t m, size_t k, size_t n) {
+    // Thread block computes BM x BN tile of C
+    // Each thread computes TM x TN elements
+    // Block has (BM/TM) x (BN/TN) = 16 x 16 = 256 threads
+
+    const int tx = threadIdx.x;  // 0-15
+    const int ty = threadIdx.y;  // 0-15
+
+    // Position of this thread's TM x TN tile in the output block
+    const int thread_row = ty * TM;  // Starting row within block tile
+    const int thread_col = tx * TN;  // Starting col within block tile
+
+    // Global position of the block tile
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
+
+    // Double buffered shared memory
+    __shared__ float As[2][BK][BM];  // Transposed for coalesced access
+    __shared__ float Bs[2][BK][BN];
+
+    // Register tile for accumulation (TM x TN per thread)
+    float reg_c[TM][TN] = {0.0f};
+
+    // Register tiles for A and B fragments
+    float reg_a[TM];
+    float reg_b[TN];
+
+    // Number of threads per block
+    const int num_threads = (BM / TM) * (BN / TN);  // 256
+    const int tid = ty * (BN / TN) + tx;  // Linear thread ID
+
+    // Calculate how many elements each thread loads for A and B
+    // A tile: BM x BK = 128 x 8 = 1024 elements, 256 threads -> 4 elements per thread
+    // B tile: BK x BN = 8 x 128 = 1024 elements, 256 threads -> 4 elements per thread
+    const int a_tile_elements = BM * BK;
+    const int b_tile_elements = BK * BN;
+    const int a_loads_per_thread = (a_tile_elements + num_threads - 1) / num_threads;
+    const int b_loads_per_thread = (b_tile_elements + num_threads - 1) / num_threads;
+
+    // Number of K tiles
+    const int num_k_tiles = (k + BK - 1) / BK;
+
+    // Current buffer index for double buffering
+    int buf_idx = 0;
+
+    // Preload first tile into shared memory (buffer 0)
+    #pragma unroll
+    for (int i = 0; i < a_loads_per_thread; i++) {
+        int elem_idx = tid + i * num_threads;
+        if (elem_idx < a_tile_elements) {
+            int a_row = elem_idx / BK;
+            int a_col = elem_idx % BK;
+            int global_row = block_row + a_row;
+            int global_col = a_col;
+            if (global_row < m && global_col < k) {
+                As[0][a_col][a_row] = a[global_row * k + global_col];
+            } else {
+                As[0][a_col][a_row] = 0.0f;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < b_loads_per_thread; i++) {
+        int elem_idx = tid + i * num_threads;
+        if (elem_idx < b_tile_elements) {
+            int b_row = elem_idx / BN;
+            int b_col = elem_idx % BN;
+            int global_row = b_row;
+            int global_col = block_col + b_col;
+            if (global_row < k && global_col < n) {
+                Bs[0][b_row][b_col] = b[global_row * n + global_col];
+            } else {
+                Bs[0][b_row][b_col] = 0.0f;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // Main loop with double buffering
+    for (int tile = 0; tile < num_k_tiles; tile++) {
+        int next_buf = 1 - buf_idx;
+        int next_tile = tile + 1;
+
+        // Prefetch next tile into alternate buffer (if not last tile)
+        if (next_tile < num_k_tiles) {
+            #pragma unroll
+            for (int i = 0; i < a_loads_per_thread; i++) {
+                int elem_idx = tid + i * num_threads;
+                if (elem_idx < a_tile_elements) {
+                    int a_row = elem_idx / BK;
+                    int a_col = elem_idx % BK;
+                    int global_row = block_row + a_row;
+                    int global_col = next_tile * BK + a_col;
+                    if (global_row < m && global_col < k) {
+                        As[next_buf][a_col][a_row] = a[global_row * k + global_col];
+                    } else {
+                        As[next_buf][a_col][a_row] = 0.0f;
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int i = 0; i < b_loads_per_thread; i++) {
+                int elem_idx = tid + i * num_threads;
+                if (elem_idx < b_tile_elements) {
+                    int b_row = elem_idx / BN;
+                    int b_col = elem_idx % BN;
+                    int global_row = next_tile * BK + b_row;
+                    int global_col = block_col + b_col;
+                    if (global_row < k && global_col < n) {
+                        Bs[next_buf][b_row][b_col] = b[global_row * n + global_col];
+                    } else {
+                        Bs[next_buf][b_row][b_col] = 0.0f;
+                    }
+                }
+            }
+        }
+
+        // Compute on current buffer
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk++) {
+            // Load A fragment into registers
+            #pragma unroll
+            for (int i = 0; i < TM; i++) {
+                reg_a[i] = As[buf_idx][kk][thread_row + i];
+            }
+
+            // Load B fragment into registers
+            #pragma unroll
+            for (int j = 0; j < TN; j++) {
+                reg_b[j] = Bs[buf_idx][kk][thread_col + j];
+            }
+
+            // Compute outer product
+            #pragma unroll
+            for (int i = 0; i < TM; i++) {
+                #pragma unroll
+                for (int j = 0; j < TN; j++) {
+                    reg_c[i][j] += reg_a[i] * reg_b[j];
+                }
+            }
+        }
+
+        buf_idx = next_buf;
+        __syncthreads();
+    }
+
+    // Write results to global memory
+    #pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int global_row = block_row + thread_row + i;
+        if (global_row < m) {
+            #pragma unroll
+            for (int j = 0; j < TN; j++) {
+                int global_col = block_col + thread_col + j;
+                if (global_col < n) {
+                    c[global_row * n + global_col] = reg_c[i][j];
+                }
+            }
+        }
+    }
+}
+
+// Fallback kernel for small matrices
+__global__ void matmul_kernel_simple(const float* a, const float* b, float* c,
+                                      size_t m, size_t k, size_t n) {
     __shared__ float As[TILE_SIZE][TILE_SIZE];
     __shared__ float Bs[TILE_SIZE][TILE_SIZE];
 
@@ -224,10 +456,160 @@ __global__ void matmul_kernel(const float* a, const float* b, float* c,
     }
 }
 
-// Transposed matmul: c = a @ b^T
+// Optimized transposed matmul: c = a @ b^T
 // a: (m, k), b: (n, k), c: (m, n)
-__global__ void matmul_transposed_kernel(const float* a, const float* b, float* c,
-                                          size_t m, size_t k, size_t n) {
+// With Register Tiling, Double Buffering, and Warp-level parallelism
+__global__ void matmul_transposed_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                          float* __restrict__ c, size_t m, size_t k, size_t n) {
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int thread_row = ty * TM;
+    const int thread_col = tx * TN;
+
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
+
+    // Double buffered shared memory
+    __shared__ float As[2][BK][BM];
+    __shared__ float Bs[2][BK][BN];
+
+    float reg_c[TM][TN] = {0.0f};
+    float reg_a[TM];
+    float reg_b[TN];
+
+    const int num_threads = (BM / TM) * (BN / TN);
+    const int tid = ty * (BN / TN) + tx;
+
+    const int a_tile_elements = BM * BK;
+    const int b_tile_elements = BN * BK;
+    const int a_loads_per_thread = (a_tile_elements + num_threads - 1) / num_threads;
+    const int b_loads_per_thread = (b_tile_elements + num_threads - 1) / num_threads;
+
+    const int num_k_tiles = (k + BK - 1) / BK;
+
+    int buf_idx = 0;
+
+    // Preload first tile
+    #pragma unroll
+    for (int i = 0; i < a_loads_per_thread; i++) {
+        int elem_idx = tid + i * num_threads;
+        if (elem_idx < a_tile_elements) {
+            int a_row = elem_idx / BK;
+            int a_col = elem_idx % BK;
+            int global_row = block_row + a_row;
+            int global_col = a_col;
+            if (global_row < m && global_col < k) {
+                As[0][a_col][a_row] = a[global_row * k + global_col];
+            } else {
+                As[0][a_col][a_row] = 0.0f;
+            }
+        }
+    }
+
+    // For transposed B: b is (n, k), we want to access b[col, kk]
+    #pragma unroll
+    for (int i = 0; i < b_loads_per_thread; i++) {
+        int elem_idx = tid + i * num_threads;
+        if (elem_idx < b_tile_elements) {
+            int b_col_local = elem_idx / BK;  // Column in the BN tile
+            int b_k = elem_idx % BK;          // K index
+            int global_col = block_col + b_col_local;  // Which row of B (since B is n x k)
+            int global_k = b_k;
+            if (global_col < n && global_k < k) {
+                Bs[0][b_k][b_col_local] = b[global_col * k + global_k];
+            } else {
+                Bs[0][b_k][b_col_local] = 0.0f;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // Main loop with double buffering
+    for (int tile = 0; tile < num_k_tiles; tile++) {
+        int next_buf = 1 - buf_idx;
+        int next_tile = tile + 1;
+
+        if (next_tile < num_k_tiles) {
+            #pragma unroll
+            for (int i = 0; i < a_loads_per_thread; i++) {
+                int elem_idx = tid + i * num_threads;
+                if (elem_idx < a_tile_elements) {
+                    int a_row = elem_idx / BK;
+                    int a_col = elem_idx % BK;
+                    int global_row = block_row + a_row;
+                    int global_col = next_tile * BK + a_col;
+                    if (global_row < m && global_col < k) {
+                        As[next_buf][a_col][a_row] = a[global_row * k + global_col];
+                    } else {
+                        As[next_buf][a_col][a_row] = 0.0f;
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int i = 0; i < b_loads_per_thread; i++) {
+                int elem_idx = tid + i * num_threads;
+                if (elem_idx < b_tile_elements) {
+                    int b_col_local = elem_idx / BK;
+                    int b_k = elem_idx % BK;
+                    int global_col = block_col + b_col_local;
+                    int global_k = next_tile * BK + b_k;
+                    if (global_col < n && global_k < k) {
+                        Bs[next_buf][b_k][b_col_local] = b[global_col * k + global_k];
+                    } else {
+                        Bs[next_buf][b_k][b_col_local] = 0.0f;
+                    }
+                }
+            }
+        }
+
+        // Compute on current buffer
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk++) {
+            #pragma unroll
+            for (int i = 0; i < TM; i++) {
+                reg_a[i] = As[buf_idx][kk][thread_row + i];
+            }
+
+            #pragma unroll
+            for (int j = 0; j < TN; j++) {
+                reg_b[j] = Bs[buf_idx][kk][thread_col + j];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < TM; i++) {
+                #pragma unroll
+                for (int j = 0; j < TN; j++) {
+                    reg_c[i][j] += reg_a[i] * reg_b[j];
+                }
+            }
+        }
+
+        buf_idx = next_buf;
+        __syncthreads();
+    }
+
+    // Write results to global memory
+    #pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int global_row = block_row + thread_row + i;
+        if (global_row < m) {
+            #pragma unroll
+            for (int j = 0; j < TN; j++) {
+                int global_col = block_col + thread_col + j;
+                if (global_col < n) {
+                    c[global_row * n + global_col] = reg_c[i][j];
+                }
+            }
+        }
+    }
+}
+
+// Fallback transposed kernel for small matrices
+__global__ void matmul_transposed_kernel_simple(const float* a, const float* b, float* c,
+                                                 size_t m, size_t k, size_t n) {
     __shared__ float As[TILE_SIZE][TILE_SIZE];
     __shared__ float Bs[TILE_SIZE][TILE_SIZE];
 
@@ -238,7 +620,7 @@ __global__ void matmul_transposed_kernel(const float* a, const float* b, float* 
 
     for (size_t t = 0; t < (k + TILE_SIZE - 1) / TILE_SIZE; t++) {
         size_t a_col = t * TILE_SIZE + threadIdx.x;
-        size_t b_col = t * TILE_SIZE + threadIdx.y;  // Note: b is transposed
+        size_t b_col = t * TILE_SIZE + threadIdx.y;
 
         if (row < m && a_col < k) {
             As[threadIdx.y][threadIdx.x] = a[row * k + a_col];
@@ -246,7 +628,6 @@ __global__ void matmul_transposed_kernel(const float* a, const float* b, float* 
             As[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
-        // b^T access: b[col, b_col] = b[col * k + b_col]
         if (col < n && b_col < k) {
             Bs[threadIdx.y][threadIdx.x] = b[col * k + b_col];
         } else {
@@ -408,10 +789,18 @@ void matmul(const Tensor& a, const Tensor& b, Tensor& c) {
     size_t k = a.size(1);
     size_t n = b.size(1);
 
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE, (m + TILE_SIZE - 1) / TILE_SIZE);
-
-    matmul_kernel<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
+    // Use optimized kernel for large matrices, simple kernel for small ones
+    if (m >= BM && n >= BN && k >= BK) {
+        // Optimized kernel: 16x16 threads, each computing 8x8 elements
+        dim3 block(BN / TN, BM / TM);  // 16x16 = 256 threads
+        dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
+        matmul_kernel<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
+    } else {
+        // Fallback to simple kernel for small matrices
+        dim3 block(TILE_SIZE, TILE_SIZE);
+        dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE, (m + TILE_SIZE - 1) / TILE_SIZE);
+        matmul_kernel_simple<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
+    }
     CHECK_CUDA(cudaGetLastError());
 }
 
@@ -420,9 +809,16 @@ void matmul_transposed(const Tensor& a, const Tensor& b, Tensor& c) {
     size_t k = a.size(1);
     size_t n = b.size(0);
 
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE, (m + TILE_SIZE - 1) / TILE_SIZE);
-    matmul_transposed_kernel<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
+    // Use optimized kernel for large matrices, simple kernel for small ones
+    if (m >= BM && n >= BN && k >= BK) {
+        dim3 block(BN / TN, BM / TM);  // 16x16 = 256 threads
+        dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
+        matmul_transposed_kernel<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
+    } else {
+        dim3 block(TILE_SIZE, TILE_SIZE);
+        dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE, (m + TILE_SIZE - 1) / TILE_SIZE);
+        matmul_transposed_kernel_simple<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
+    }
     CHECK_CUDA(cudaGetLastError());
 }
 
