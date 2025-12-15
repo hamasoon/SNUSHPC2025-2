@@ -54,8 +54,26 @@ private:
     // Maps local expert index to global expert index
     std::vector<int> local_to_global_expert_;
 
-    void route_tokens(const Tensor& router_logits, std::vector<int>& top_k_indices,
-                     std::vector<float>& top_k_weights);
+    // Pre-allocated buffers to avoid cudaMalloc/cudaFree per call
+    int* d_top_k_indices_;
+    float* d_top_k_weights_;
+    size_t routing_buffer_size_;  // max num_tokens supported
+
+    // Pre-allocated buffers for gather/scatter operations
+    int* d_gather_indices_;      // GPU buffer for token indices per expert
+    float* d_scatter_weights_;   // GPU buffer for scatter weights per expert
+    size_t gather_scatter_buffer_size_;
+
+    // Buffers for fully GPU-based routing
+    int* d_expert_counts_;       // Count per local expert
+    int* d_expert_offsets_;      // Prefix sum offsets per expert
+    int* d_expert_write_pos_;    // Current write position per expert (for building indices)
+    int* d_sorted_indices_;      // Token indices sorted by expert
+    float* d_sorted_weights_;    // Weights sorted by expert
+
+    void route_tokens_gpu(const Tensor& router_logits, size_t num_tokens);
+    void ensure_routing_buffers(size_t num_tokens);
+    void ensure_gather_scatter_buffers(size_t max_tokens_per_expert);
 };
 
 // Multi-Head Attention

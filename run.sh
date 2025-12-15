@@ -2,9 +2,9 @@
 
 # Use 4 nodes by default for optimal data parallelism
 : ${NODES:=4}
-: ${SAMPLES:=64}
+: ${SAMPLES:=16}
 
 salloc -N $NODES --partition class1 --exclusive --gres=gpu:4   \
-	mpirun --bind-to none -mca btl ^openib -npernode 4 \
+		mpirun --bind-to none -mca btl ^openib -npernode 4 \
 		--oversubscribe \
-		./main -w -n 64 $@
+		./main -w -n $SAMPLES $@

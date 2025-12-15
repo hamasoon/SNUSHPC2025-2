@@ -67,6 +67,16 @@ __global__ void silu_kernel(const float* x, float* y, size_t n) {
     }
 }
 
+// Fused SiLU + Mul kernel: y = silu(gate) * up
+__global__ void silu_mul_kernel(const float* gate, const float* up, float* y, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float g = gate[idx];
+        float silu_g = g / (1.0f + expf(-g));
+        y[idx] = silu_g * up[idx];
+    }
+}
+
 // ============================================================================
 // Softmax kernel (optimized with shared memory)
 // ============================================================================
@@ -412,7 +422,6 @@ void matmul_transposed(const Tensor& a, const Tensor& b, Tensor& c) {
 
     dim3 block(TILE_SIZE, TILE_SIZE);
     dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE, (m + TILE_SIZE - 1) / TILE_SIZE);
-
     matmul_transposed_kernel<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
     CHECK_CUDA(cudaGetLastError());
 }
@@ -458,6 +467,14 @@ void silu(const Tensor& x, Tensor& y) {
     size_t n = x.size();
     int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
     silu_kernel<<<blocks, BLOCK_SIZE>>>(x.data(), y.data(), n);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+// Fused silu + mul: y = silu(gate) * up
+void silu_mul(const Tensor& gate, const Tensor& up, Tensor& y) {
+    size_t n = gate.size();
+    int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    silu_mul_kernel<<<blocks, BLOCK_SIZE>>>(gate.data(), up.data(), y.data(), n);
     CHECK_CUDA(cudaGetLastError());
 }
 

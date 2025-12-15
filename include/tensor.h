@@ -158,6 +158,7 @@ namespace tensor_ops {
     
     // Activation functions
     void silu(const Tensor& x, Tensor& y); // SiLU(x) = x * sigmoid(x)
+    void silu_mul(const Tensor& gate, const Tensor& up, Tensor& y); // Fused: y = silu(gate) * up
     void sigmoid(const Tensor& x, Tensor& y);
     void softmax(const Tensor& x, Tensor& y, int dim);
     

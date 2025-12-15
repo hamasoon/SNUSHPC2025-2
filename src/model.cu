@@ -417,6 +417,87 @@ __global__ void copy_token_input_kernel(const float* x_flat, float* token_in,
     }
 }
 
+// Batched gather kernel: gather multiple tokens in parallel
+// token_indices: array of token indices to gather
+// batch_size: number of tokens to gather
+__global__ void batched_gather_kernel(const float* x_flat, float* batched_input,
+                                       const int* token_indices, size_t batch_size,
+                                       size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch_size * hidden_size;
+
+    if (idx < total) {
+        size_t token_batch_idx = idx / hidden_size;
+        size_t dim = idx % hidden_size;
+        int src_token = token_indices[token_batch_idx];
+        batched_input[idx] = x_flat[src_token * hidden_size + dim];
+    }
+}
+
+// Batched scatter-accumulate kernel: scatter and accumulate multiple expert outputs in parallel
+// Uses atomicAdd since different tokens may map to the same output position
+__global__ void batched_scatter_accumulate_kernel(float* y, const float* batched_output,
+                                                   const int* token_indices, const float* weights,
+                                                   size_t batch_size, size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch_size * hidden_size;
+
+    if (idx < total) {
+        size_t token_batch_idx = idx / hidden_size;
+        size_t dim = idx % hidden_size;
+        int dst_token = token_indices[token_batch_idx];
+        float weight = weights[token_batch_idx];
+        atomicAdd(&y[dst_token * hidden_size + dim], weight * batched_output[idx]);
+    }
+}
+
+// Count tokens per expert for a specific GPU's local experts
+// expert_start: first global expert index for this GPU
+// num_local_experts: number of experts on this GPU
+__global__ void count_tokens_per_expert_kernel(const int* top_k_indices, int* expert_counts,
+                                                size_t num_tokens, size_t k,
+                                                int expert_start, int num_local_experts) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = num_tokens * k;
+
+    if (idx < total) {
+        int expert_idx = top_k_indices[idx];
+        // Check if expert belongs to this GPU
+        int local_expert = expert_idx - expert_start;
+        if (local_expert >= 0 && local_expert < num_local_experts) {
+            atomicAdd(&expert_counts[local_expert], 1);
+        }
+    }
+}
+
+// Build sorted indices for each expert
+// Given top_k_indices and offsets, populate sorted_indices and sorted_weights
+__global__ void build_expert_indices_kernel(const int* top_k_indices, const float* top_k_weights,
+                                             int* sorted_indices, float* sorted_weights,
+                                             int* expert_write_pos, const int* expert_offsets,
+                                             size_t num_tokens, size_t k,
+                                             int expert_start, int num_local_experts) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = num_tokens * k;
+
+    if (idx < total) {
+        int expert_idx = top_k_indices[idx];
+        int local_expert = expert_idx - expert_start;
+
+        if (local_expert >= 0 && local_expert < num_local_experts) {
+            // Get write position for this expert using atomicAdd
+            int write_pos = atomicAdd(&expert_write_pos[local_expert], 1);
+            int offset = expert_offsets[local_expert];
+
+            // Token index is idx / k (which token this routing entry belongs to)
+            int token_idx = idx / k;
+
+            sorted_indices[offset + write_pos] = token_idx;
+            sorted_weights[offset + write_pos] = top_k_weights[idx];
+        }
+    }
+}
+
 // ============================================================================
 // MLP Implementation
 // ============================================================================
@@ -435,33 +516,35 @@ void MLP::forward(const Tensor& x, Tensor& y) {
 
     Tensor x_flat = x.view({batch * seq_len, hidden_size});
 
+    // Gate projection: gate = x @ w1^T
     Tensor gate({batch * seq_len, intermediate_size});
     tensor_ops::matmul_transposed(x_flat, w1_, gate);
-    Tensor gate_silu({batch * seq_len, intermediate_size});
-    tensor_ops::silu(gate, gate_silu);
 
+    // Up projection: up = x @ w3^T
     Tensor up({batch * seq_len, intermediate_size});
     tensor_ops::matmul_transposed(x_flat, w3_, up);
 
+    // Fused SiLU + Mul: hidden = silu(gate) * up
     Tensor hidden({batch * seq_len, intermediate_size});
-    tensor_ops::mul(gate_silu, up, hidden);
+    tensor_ops::silu_mul(gate, up, hidden);
 
-    Tensor y_flat({batch * seq_len, hidden_size});
-    tensor_ops::matmul_transposed(hidden, w2_, y_flat);
-
-    y_flat.reshape({batch, seq_len, hidden_size});
-
+    // Down projection directly into y
     if (y.size() == 0) {
         y = Tensor({batch, seq_len, hidden_size});
     }
-    CHECK_CUDA(cudaMemcpy(y.data(), y_flat.data(), y.size() * sizeof(float), cudaMemcpyDeviceToDevice));
+    Tensor y_flat = y.view({batch * seq_len, hidden_size});
+    tensor_ops::matmul_transposed(hidden, w2_, y_flat);
 }
 
 // ============================================================================
 // SparseMoeBlock Implementation with Expert Parallelism
 // ============================================================================
 
-SparseMoeBlock::SparseMoeBlock(int layer_idx) : layer_idx_(layer_idx) {
+SparseMoeBlock::SparseMoeBlock(int layer_idx)
+    : layer_idx_(layer_idx), d_top_k_indices_(nullptr), d_top_k_weights_(nullptr), routing_buffer_size_(0),
+      d_gather_indices_(nullptr), d_scatter_weights_(nullptr), gather_scatter_buffer_size_(0),
+      d_expert_counts_(nullptr), d_expert_offsets_(nullptr), d_expert_write_pos_(nullptr),
+      d_sorted_indices_(nullptr), d_sorted_weights_(nullptr) {
     std::stringstream ss;
     ss << "layers." << layer_idx << ".feed_forward.gate.weight";
     gate_ = Tensor::load_from_file(ss.str());
@@ -488,15 +571,62 @@ SparseMoeBlock::SparseMoeBlock(int layer_idx) : layer_idx_(layer_idx) {
         ss_bias << "layers." << layer_idx << ".feed_forward.expert_bias";
         expert_bias_ = Tensor::load_from_file(ss_bias.str());
     }
+
+    // Pre-allocate routing buffers for typical batch size
+    // Will be resized if needed
+    ensure_routing_buffers(64);  // Initial size for 64 tokens
+    ensure_gather_scatter_buffers(64);  // Initial size for gather/scatter
 }
 
-void SparseMoeBlock::route_tokens(const Tensor& router_logits,
-                                   std::vector<int>& top_k_indices,
-                                   std::vector<float>& top_k_weights) {
-    size_t num_tokens = router_logits.size(0);
+void SparseMoeBlock::ensure_routing_buffers(size_t num_tokens) {
+    if (num_tokens <= routing_buffer_size_) return;
 
-    top_k_indices.resize(num_tokens * NUM_EXPERTS_PER_TOK);
-    top_k_weights.resize(num_tokens * NUM_EXPERTS_PER_TOK);
+    // Free old buffers if they exist
+    if (d_top_k_indices_ != nullptr) cudaFree(d_top_k_indices_);
+    if (d_top_k_weights_ != nullptr) cudaFree(d_top_k_weights_);
+    if (d_expert_counts_ != nullptr) cudaFree(d_expert_counts_);
+    if (d_expert_offsets_ != nullptr) cudaFree(d_expert_offsets_);
+    if (d_expert_write_pos_ != nullptr) cudaFree(d_expert_write_pos_);
+    if (d_sorted_indices_ != nullptr) cudaFree(d_sorted_indices_);
+    if (d_sorted_weights_ != nullptr) cudaFree(d_sorted_weights_);
+
+    // Allocate new buffers with some headroom
+    size_t new_size = num_tokens * 2;  // 2x headroom
+    CHECK_CUDA(cudaMalloc(&d_top_k_indices_, new_size * NUM_EXPERTS_PER_TOK * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_top_k_weights_, new_size * NUM_EXPERTS_PER_TOK * sizeof(float)));
+
+    // Allocate GPU-only routing buffers
+    CHECK_CUDA(cudaMalloc(&d_expert_counts_, NUM_EXPERTS_PER_GPU * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_expert_offsets_, (NUM_EXPERTS_PER_GPU + 1) * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_expert_write_pos_, NUM_EXPERTS_PER_GPU * sizeof(int)));
+    // Max possible: every token could go to every local expert with top-k routing
+    CHECK_CUDA(cudaMalloc(&d_sorted_indices_, new_size * NUM_EXPERTS_PER_TOK * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_sorted_weights_, new_size * NUM_EXPERTS_PER_TOK * sizeof(float)));
+
+    routing_buffer_size_ = new_size;
+}
+
+void SparseMoeBlock::ensure_gather_scatter_buffers(size_t max_tokens_per_expert) {
+    if (max_tokens_per_expert <= gather_scatter_buffer_size_) return;
+
+    // Free old buffers if they exist
+    if (d_gather_indices_ != nullptr) {
+        cudaFree(d_gather_indices_);
+    }
+    if (d_scatter_weights_ != nullptr) {
+        cudaFree(d_scatter_weights_);
+    }
+
+    // Allocate new buffers with some headroom
+    size_t new_size = max_tokens_per_expert * 2;
+    CHECK_CUDA(cudaMalloc(&d_gather_indices_, new_size * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_scatter_weights_, new_size * sizeof(float)));
+    gather_scatter_buffer_size_ = new_size;
+}
+
+void SparseMoeBlock::route_tokens_gpu(const Tensor& router_logits, size_t num_tokens) {
+    // Ensure pre-allocated buffers are large enough
+    ensure_routing_buffers(num_tokens);
 
     Tensor routing_weights({num_tokens, NUM_EXPERTS});
 
@@ -505,27 +635,23 @@ void SparseMoeBlock::route_tokens(const Tensor& router_logits,
         router_logits.data(), routing_weights.data(), num_tokens, NUM_EXPERTS);
     CHECK_CUDA(cudaGetLastError());
 
-    int* d_top_k_indices;
-    float* d_top_k_weights;
-    CHECK_CUDA(cudaMalloc(&d_top_k_indices, num_tokens * NUM_EXPERTS_PER_TOK * sizeof(int)));
-    CHECK_CUDA(cudaMalloc(&d_top_k_weights, num_tokens * NUM_EXPERTS_PER_TOK * sizeof(float)));
-
     size_t shared_mem = NUM_EXPERTS * sizeof(float) + NUM_EXPERTS * sizeof(int);
     topk_routing_kernel<<<num_tokens, 32, shared_mem>>>(
         routing_weights.data(),
         USE_EXPERT_BIAS ? expert_bias_.data() : nullptr,
-        d_top_k_indices, d_top_k_weights,
+        d_top_k_indices_, d_top_k_weights_,
         num_tokens, NUM_EXPERTS, NUM_EXPERTS_PER_TOK,
         USE_EXPERT_BIAS, NORM_TOPK_PROB, ROUTED_SCALING_FACTOR);
     CHECK_CUDA(cudaGetLastError());
 
-    CHECK_CUDA(cudaMemcpy(top_k_indices.data(), d_top_k_indices,
-                          num_tokens * NUM_EXPERTS_PER_TOK * sizeof(int), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(top_k_weights.data(), d_top_k_weights,
-                          num_tokens * NUM_EXPERTS_PER_TOK * sizeof(float), cudaMemcpyDeviceToHost));
-
-    CHECK_CUDA(cudaFree(d_top_k_indices));
-    CHECK_CUDA(cudaFree(d_top_k_weights));
+    // Count tokens per local expert (GPU kernel)
+    CHECK_CUDA(cudaMemset(d_expert_counts_, 0, NUM_EXPERTS_PER_GPU * sizeof(int)));
+    int count_blocks = (num_tokens * NUM_EXPERTS_PER_TOK + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    count_tokens_per_expert_kernel<<<count_blocks, BLOCK_SIZE>>>(
+        d_top_k_indices_, d_expert_counts_,
+        num_tokens, NUM_EXPERTS_PER_TOK,
+        g_parallel_ctx.expert_start, NUM_EXPERTS_PER_GPU);
+    CHECK_CUDA(cudaGetLastError());
 }
 
 void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) {
@@ -540,65 +666,69 @@ void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) 
     router_logits = Tensor({num_tokens, NUM_EXPERTS});
     tensor_ops::matmul_transposed(x_flat, gate_, router_logits);
 
-    // Route tokens
-    std::vector<int> top_k_indices;
-    std::vector<float> top_k_weights;
-    route_tokens(router_logits, top_k_indices, top_k_weights);
+    // Route tokens entirely on GPU (no D2H sync for routing)
+    route_tokens_gpu(router_logits, num_tokens);
 
     // Initialize output
     y = Tensor({batch, seq_len, hidden_size});
     y.zero();
 
-    // Prepare buffers for expert parallelism
-    // Count tokens per expert for this GPU's local experts
-    std::vector<std::vector<int>> tokens_for_expert(NUM_EXPERTS_PER_GPU);
-    std::vector<std::vector<float>> weights_for_expert(NUM_EXPERTS_PER_GPU);
+    // Copy expert counts to host for iteration (small transfer: NUM_EXPERTS_PER_GPU ints)
+    int h_expert_counts[NUM_EXPERTS_PER_GPU];
+    int h_expert_offsets[NUM_EXPERTS_PER_GPU + 1];
+    CHECK_CUDA(cudaMemcpy(h_expert_counts, d_expert_counts_,
+                          NUM_EXPERTS_PER_GPU * sizeof(int), cudaMemcpyDeviceToHost));
 
-    for (size_t t = 0; t < num_tokens; t++) {
-        for (size_t k = 0; k < NUM_EXPERTS_PER_TOK; k++) {
-            int expert_idx = top_k_indices[t * NUM_EXPERTS_PER_TOK + k];
-            float weight = top_k_weights[t * NUM_EXPERTS_PER_TOK + k];
-
-            // Check if this expert is local to this GPU
-            if (g_parallel_ctx.is_expert_local(expert_idx)) {
-                int local_idx = expert_idx - g_parallel_ctx.expert_start;
-                tokens_for_expert[local_idx].push_back(t);
-                weights_for_expert[local_idx].push_back(weight);
-            }
-        }
+    // Compute prefix sums (offsets) on host - this is fast for 8 values
+    h_expert_offsets[0] = 0;
+    for (int i = 0; i < NUM_EXPERTS_PER_GPU; i++) {
+        h_expert_offsets[i + 1] = h_expert_offsets[i] + h_expert_counts[i];
     }
 
-    // Allocate temporary buffers for batched processing
-    Tensor token_in({1, 1, hidden_size});
-    Tensor expert_out({1, 1, hidden_size});
+    // Copy offsets to GPU
+    CHECK_CUDA(cudaMemcpy(d_expert_offsets_, h_expert_offsets,
+                          (NUM_EXPERTS_PER_GPU + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
-    // Process local experts on compute stream
-    cudaStream_t compute_stream = g_parallel_ctx.compute_stream;
-    for (size_t local_e = 0; local_e < NUM_EXPERTS_PER_GPU; local_e++) {
-        if (tokens_for_expert[local_e].empty()) continue;
+    // Reset write positions to 0 (will be used atomically)
+    CHECK_CUDA(cudaMemset(d_expert_write_pos_, 0, NUM_EXPERTS_PER_GPU * sizeof(int)));
 
-        for (size_t i = 0; i < tokens_for_expert[local_e].size(); i++) {
-            int t = tokens_for_expert[local_e][i];
-            float weight = weights_for_expert[local_e][i];
-
-            // Copy token input on compute stream
-            int token_blocks = (hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            copy_token_input_kernel<<<token_blocks, BLOCK_SIZE, 0, compute_stream>>>(
-                x_flat.data(), token_in.data(), t, hidden_size);
-
-            // Process through expert (uses default stream, sync with compute)
-            CHECK_CUDA(cudaStreamSynchronize(compute_stream));
-            local_experts_[local_e].forward(token_in, expert_out);
-
-            // Accumulate weighted output on compute stream
-            accumulate_expert_output_kernel<<<token_blocks, BLOCK_SIZE, 0, compute_stream>>>(
-                y.data(), expert_out.data(), weight, t * hidden_size, hidden_size);
-        }
-    }
+    // Build sorted indices on GPU
+    int build_blocks = (num_tokens * NUM_EXPERTS_PER_TOK + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    build_expert_indices_kernel<<<build_blocks, BLOCK_SIZE>>>(
+        d_top_k_indices_, d_top_k_weights_,
+        d_sorted_indices_, d_sorted_weights_,
+        d_expert_write_pos_, d_expert_offsets_,
+        num_tokens, NUM_EXPERTS_PER_TOK,
+        g_parallel_ctx.expert_start, NUM_EXPERTS_PER_GPU);
     CHECK_CUDA(cudaGetLastError());
 
-    // Wait for compute to finish before D2H transfer
-    CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+    // Process local experts with batched tokens - all indices already on GPU
+    for (int local_e = 0; local_e < NUM_EXPERTS_PER_GPU; local_e++) {
+        int batch_size = h_expert_counts[local_e];
+        if (batch_size == 0) continue;
+
+        int offset = h_expert_offsets[local_e];
+
+        // Gather all tokens for this expert using batched kernel
+        // Token indices and weights are already at d_sorted_indices_ + offset
+        Tensor batched_input({(size_t)batch_size, 1, hidden_size});
+        int gather_blocks = (batch_size * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        batched_gather_kernel<<<gather_blocks, BLOCK_SIZE>>>(
+            x_flat.data(), batched_input.data(), d_sorted_indices_ + offset,
+            batch_size, hidden_size);
+        CHECK_CUDA(cudaGetLastError());
+
+        // Process entire batch through expert at once
+        Tensor batched_output({(size_t)batch_size, 1, hidden_size});
+        local_experts_[local_e].forward(batched_input, batched_output);
+
+        // Scatter weighted outputs back to y using batched kernel
+        int scatter_blocks = (batch_size * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        batched_scatter_accumulate_kernel<<<scatter_blocks, BLOCK_SIZE>>>(
+            y.data(), batched_output.data(), d_sorted_indices_ + offset,
+            d_sorted_weights_ + offset, batch_size, hidden_size);
+        CHECK_CUDA(cudaGetLastError());
+    }
 
     // Synchronize and reduce across GPUs within the node
     // Use async D2H transfer
@@ -914,6 +1044,10 @@ LFM2Model::LFM2Model(const std::string& model_file) {
 
     g_model_loader = std::make_unique<ModelLoader>(model_file);
 
+    // Note: We use lazy GPU caching - tensors are cached on first load
+    // and reused on subsequent accesses. This avoids OOM from preloading
+    // all tensors at once, while still eliminating repeated H2D transfers.
+
     load_embeddings();
     load_layers();
     load_output_layers();
@@ -922,6 +1056,8 @@ LFM2Model::LFM2Model(const std::string& model_file) {
 
     if (g_parallel_ctx.world_rank == 0) {
         std::cout << "Model loaded successfully!" << std::endl;
+        std::cout << "GPU memory used for weights: "
+                  << (g_model_loader->get_cached_memory_bytes() / (1024.0 * 1024.0)) << " MB" << std::endl;
     }
 }
 
