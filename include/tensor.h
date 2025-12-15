@@ -4,6 +4,8 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <unordered_map>
+#include <mutex>
 #include <cuda_runtime.h>
 
 /* Macro for checking CUDA errors */
@@ -17,6 +19,32 @@
     }                                                                    \
   } while (0)
 
+/**
+ * GPU Memory Pool for reducing cudaMalloc/cudaFree overhead.
+ * Uses size-bucketing strategy to reuse GPU memory buffers.
+ */
+class GPUMemoryPool {
+public:
+    static GPUMemoryPool& instance();
+    float* allocate(size_t num_elements);
+    void deallocate(float* ptr, size_t num_elements);
+    void clear();
+
+    GPUMemoryPool(const GPUMemoryPool&) = delete;
+    GPUMemoryPool& operator=(const GPUMemoryPool&) = delete;
+
+private:
+    GPUMemoryPool();
+    ~GPUMemoryPool();
+    size_t bucket_size(size_t num_elements) const;
+
+    std::unordered_map<size_t, std::vector<float*>> free_buffers_;
+    mutable std::mutex mutex_;
+};
+
+inline GPUMemoryPool& gpu_memory_pool() {
+    return GPUMemoryPool::instance();
+}
 
 // Forward declaration
 class ModelLoader;

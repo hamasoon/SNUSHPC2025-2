@@ -10,6 +10,81 @@
 // Global model loader is declared in model.h
 extern std::unique_ptr<ModelLoader> g_model_loader;
 
+// ============================================================================
+// GPU Memory Pool Implementation
+// ============================================================================
+
+static constexpr size_t MIN_BUCKET_SIZE = 256;  // 1 KB minimum
+
+GPUMemoryPool& GPUMemoryPool::instance() {
+    static GPUMemoryPool pool;
+    return pool;
+}
+
+GPUMemoryPool::GPUMemoryPool() {}
+
+GPUMemoryPool::~GPUMemoryPool() {
+    clear();
+}
+
+size_t GPUMemoryPool::bucket_size(size_t num_elements) const {
+    if (num_elements == 0) return 0;
+    if (num_elements < MIN_BUCKET_SIZE) return MIN_BUCKET_SIZE;
+
+    // Round up to next power of 2 for sizes up to 1M elements
+    if (num_elements <= 1024 * 1024) {
+        size_t bucket = MIN_BUCKET_SIZE;
+        while (bucket < num_elements) bucket *= 2;
+        return bucket;
+    }
+    // For larger sizes, round up to nearest 1M elements
+    size_t million = 1024 * 1024;
+    return ((num_elements + million - 1) / million) * million;
+}
+
+float* GPUMemoryPool::allocate(size_t num_elements) {
+    if (num_elements == 0) return nullptr;
+
+    size_t bucket = bucket_size(num_elements);
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = free_buffers_.find(bucket);
+    if (it != free_buffers_.end() && !it->second.empty()) {
+        float* ptr = it->second.back();
+        it->second.pop_back();
+        return ptr;
+    }
+
+    float* ptr = nullptr;
+    cudaError_t err = cudaMalloc(&ptr, bucket * sizeof(float));
+    if (err != cudaSuccess) {
+        // Try to free pooled memory and retry
+        for (auto& pair : free_buffers_) {
+            for (float* buf : pair.second) cudaFree(buf);
+            pair.second.clear();
+        }
+        err = cudaMalloc(&ptr, bucket * sizeof(float));
+        if (err != cudaSuccess) return nullptr;
+    }
+    return ptr;
+}
+
+void GPUMemoryPool::deallocate(float* ptr, size_t num_elements) {
+    if (ptr == nullptr || num_elements == 0) return;
+    size_t bucket = bucket_size(num_elements);
+    std::lock_guard<std::mutex> lock(mutex_);
+    free_buffers_[bucket].push_back(ptr);
+}
+
+void GPUMemoryPool::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& pair : free_buffers_) {
+        for (float* ptr : pair.second) cudaFree(ptr);
+        pair.second.clear();
+    }
+    free_buffers_.clear();
+}
+
 // Tensor class implementation with GPU support
 
 // Tensor constructors and destructors
@@ -138,14 +213,19 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
 
 void Tensor::allocate() {
     if (size_ > 0) {
-        CHECK_CUDA(cudaMalloc(&d_data_, size_ * sizeof(float)));
+        // Use memory pool instead of direct cudaMalloc
+        d_data_ = gpu_memory_pool().allocate(size_);
+        if (d_data_ == nullptr) {
+            throw std::runtime_error("GPU memory allocation failed");
+        }
     }
 }
 
 void Tensor::deallocate() {
     if (owns_data_) {
         if (d_data_ != nullptr) {
-            cudaFree(d_data_);
+            // Return to memory pool instead of cudaFree
+            gpu_memory_pool().deallocate(d_data_, size_);
             d_data_ = nullptr;
         }
         if (h_data_ != nullptr) {
