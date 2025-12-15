@@ -6,31 +6,54 @@
 #include <algorithm>
 #include <numeric>
 #include "model_loader.h"
-#include <cuda_runtime.h>
 
 // Global model loader is declared in model.h
 extern std::unique_ptr<ModelLoader> g_model_loader;
 
-// Tensor class implementation - structure and data management only
-// All tensor operations are implemented in layer.cu
+// Tensor class implementation with GPU support
 
 // Tensor constructors and destructors
-Tensor::Tensor() : size_(0), data_(nullptr), owns_data_(false) {}
+Tensor::Tensor() : size_(0), d_data_(nullptr), h_data_(nullptr), owns_data_(false),
+                   on_gpu_(true), host_valid_(false), device_valid_(false), host_pinned_(false) {}
 
-Tensor::Tensor(const std::vector<size_t>& shape)
-    : shape_(shape), owns_data_(true) {
+Tensor::Tensor(const std::vector<size_t>& shape, bool on_gpu)
+    : shape_(shape), owns_data_(true), on_gpu_(on_gpu), host_valid_(false), device_valid_(true), host_pinned_(false) {
     size_ = compute_size();
+    h_data_ = nullptr;
     allocate();
 }
 
-Tensor::Tensor(const std::vector<size_t>& shape, float* data, bool copy)
-    : shape_(shape), owns_data_(copy) {
+Tensor::Tensor(const std::vector<size_t>& shape, float* data, bool copy, bool on_gpu)
+    : shape_(shape), owns_data_(copy), on_gpu_(on_gpu), host_pinned_(false) {
     size_ = compute_size();
+    h_data_ = nullptr;
     if (copy) {
         allocate();
-        std::memcpy(data_, data, size_ * sizeof(float));
+        if (on_gpu) {
+            // data is on CPU, copy to GPU
+            CHECK_CUDA(cudaMemcpy(d_data_, data, size_ * sizeof(float), cudaMemcpyHostToDevice));
+            device_valid_ = true;
+            host_valid_ = false;
+        } else {
+            // This shouldn't happen in our design, but handle it
+            h_data_ = new float[size_];
+            std::memcpy(h_data_, data, size_ * sizeof(float));
+            CHECK_CUDA(cudaMemcpy(d_data_, data, size_ * sizeof(float), cudaMemcpyHostToDevice));
+            device_valid_ = true;
+            host_valid_ = true;
+        }
     } else {
-        data_ = data;
+        // View - share data (assumes data is on GPU if on_gpu is true)
+        if (on_gpu) {
+            d_data_ = data;
+            device_valid_ = true;
+            host_valid_ = false;
+        } else {
+            h_data_ = data;
+            d_data_ = nullptr;
+            host_valid_ = true;
+            device_valid_ = false;
+        }
     }
 }
 
@@ -40,10 +63,16 @@ Tensor::~Tensor() {
 
 // Copy constructor
 Tensor::Tensor(const Tensor& other)
-    : shape_(other.shape_), size_(other.size_), owns_data_(true) {
+    : shape_(other.shape_), size_(other.size_), owns_data_(true),
+      on_gpu_(other.on_gpu_), host_valid_(false), device_valid_(true), host_pinned_(false) {
+    h_data_ = nullptr;
     if (other.size_ > 0) {
         allocate();
-        std::memcpy(data_, other.data_, size_ * sizeof(float));
+        if (other.device_valid_) {
+            CHECK_CUDA(cudaMemcpy(d_data_, other.d_data_, size_ * sizeof(float), cudaMemcpyDeviceToDevice));
+        } else if (other.host_valid_) {
+            CHECK_CUDA(cudaMemcpy(d_data_, other.h_data_, size_ * sizeof(float), cudaMemcpyHostToDevice));
+        }
     }
 }
 
@@ -54,9 +83,18 @@ Tensor& Tensor::operator=(const Tensor& other) {
         shape_ = other.shape_;
         size_ = other.size_;
         owns_data_ = true;
+        on_gpu_ = other.on_gpu_;
+        host_valid_ = false;
+        device_valid_ = true;
+        host_pinned_ = false;
+        h_data_ = nullptr;
         if (other.size_ > 0) {
             allocate();
-            std::memcpy(data_, other.data_, size_ * sizeof(float));
+            if (other.device_valid_) {
+                CHECK_CUDA(cudaMemcpy(d_data_, other.d_data_, size_ * sizeof(float), cudaMemcpyDeviceToDevice));
+            } else if (other.host_valid_) {
+                CHECK_CUDA(cudaMemcpy(d_data_, other.h_data_, size_ * sizeof(float), cudaMemcpyHostToDevice));
+            }
         }
     }
     return *this;
@@ -65,10 +103,14 @@ Tensor& Tensor::operator=(const Tensor& other) {
 // Move constructor
 Tensor::Tensor(Tensor&& other) noexcept
     : shape_(std::move(other.shape_)), size_(other.size_),
-      data_(other.data_), owns_data_(other.owns_data_) {
-    other.data_ = nullptr;
+      d_data_(other.d_data_), h_data_(other.h_data_), owns_data_(other.owns_data_),
+      on_gpu_(other.on_gpu_), host_valid_(other.host_valid_), device_valid_(other.device_valid_),
+      host_pinned_(other.host_pinned_) {
+    other.d_data_ = nullptr;
+    other.h_data_ = nullptr;
     other.size_ = 0;
     other.owns_data_ = false;
+    other.host_pinned_ = false;
 }
 
 // Move assignment
@@ -77,26 +119,44 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
         deallocate();
         shape_ = std::move(other.shape_);
         size_ = other.size_;
-        data_ = other.data_;
+        d_data_ = other.d_data_;
+        h_data_ = other.h_data_;
         owns_data_ = other.owns_data_;
+        on_gpu_ = other.on_gpu_;
+        host_valid_ = other.host_valid_;
+        device_valid_ = other.device_valid_;
+        host_pinned_ = other.host_pinned_;
 
-        other.data_ = nullptr;
+        other.d_data_ = nullptr;
+        other.h_data_ = nullptr;
         other.size_ = 0;
         other.owns_data_ = false;
+        other.host_pinned_ = false;
     }
     return *this;
 }
 
 void Tensor::allocate() {
     if (size_ > 0) {
-        data_ = new float[size_];
+        CHECK_CUDA(cudaMalloc(&d_data_, size_ * sizeof(float)));
     }
 }
 
 void Tensor::deallocate() {
-    if (owns_data_ && data_ != nullptr) {
-        delete[] data_;
-        data_ = nullptr;
+    if (owns_data_) {
+        if (d_data_ != nullptr) {
+            cudaFree(d_data_);
+            d_data_ = nullptr;
+        }
+        if (h_data_ != nullptr) {
+            if (host_pinned_) {
+                cudaFreeHost(h_data_);
+            } else {
+                delete[] h_data_;
+            }
+            h_data_ = nullptr;
+            host_pinned_ = false;
+        }
     }
 }
 
@@ -121,37 +181,129 @@ size_t Tensor::compute_stride(int dim) const {
     return stride;
 }
 
-// Element access
+// Ensure host data is allocated and valid
+void Tensor::ensure_host_data() const {
+    if (h_data_ == nullptr && size_ > 0) {
+        h_data_ = new float[size_];
+    }
+    if (!host_valid_ && device_valid_ && size_ > 0) {
+        CHECK_CUDA(cudaMemcpy(h_data_, d_data_, size_ * sizeof(float), cudaMemcpyDeviceToHost));
+        host_valid_ = true;
+    }
+}
+
+// Host data access
+float* Tensor::host_data() {
+    ensure_host_data();
+    device_valid_ = false; // Mark device as stale since host may be modified
+    return h_data_;
+}
+
+const float* Tensor::host_data() const {
+    ensure_host_data();
+    return h_data_;
+}
+
+// Sync operations
+void Tensor::sync_to_host() const {
+    ensure_host_data();
+}
+
+void Tensor::sync_to_device() {
+    if (!device_valid_ && host_valid_ && size_ > 0) {
+        CHECK_CUDA(cudaMemcpy(d_data_, h_data_, size_ * sizeof(float), cudaMemcpyHostToDevice));
+        device_valid_ = true;
+    }
+}
+
+// Async sync operations with CUDA streams
+void Tensor::sync_to_host_async(cudaStream_t stream) const {
+    if (h_data_ == nullptr && size_ > 0) {
+        // Must use pinned memory for async transfers
+        CHECK_CUDA(cudaMallocHost(&h_data_, size_ * sizeof(float)));
+        host_pinned_ = true;
+    }
+    if (!host_valid_ && device_valid_ && size_ > 0) {
+        CHECK_CUDA(cudaMemcpyAsync(h_data_, d_data_, size_ * sizeof(float),
+                                    cudaMemcpyDeviceToHost, stream));
+        // Note: host_valid_ will be set after stream synchronization
+    }
+}
+
+void Tensor::sync_to_device_async(cudaStream_t stream) {
+    if (!device_valid_ && host_valid_ && size_ > 0) {
+        CHECK_CUDA(cudaMemcpyAsync(d_data_, h_data_, size_ * sizeof(float),
+                                    cudaMemcpyHostToDevice, stream));
+        // Note: device_valid_ will be set after stream synchronization
+    }
+}
+
+void Tensor::to_gpu() {
+    if (!device_valid_) {
+        sync_to_device();
+    }
+    on_gpu_ = true;
+}
+
+void Tensor::to_cpu() {
+    sync_to_host();
+    on_gpu_ = false;
+}
+
+// Element access (requires sync to host)
+float& Tensor::operator[](size_t idx) {
+    ensure_host_data();
+    device_valid_ = false;
+    return h_data_[idx];
+}
+
+const float& Tensor::operator[](size_t idx) const {
+    ensure_host_data();
+    return h_data_[idx];
+}
+
 float& Tensor::at(size_t i) {
-    return data_[i];
+    ensure_host_data();
+    device_valid_ = false;
+    return h_data_[i];
 }
 
 float& Tensor::at(size_t i, size_t j) {
-    return data_[i * shape_[1] + j];
+    ensure_host_data();
+    device_valid_ = false;
+    return h_data_[i * shape_[1] + j];
 }
 
 float& Tensor::at(size_t i, size_t j, size_t k) {
-    return data_[(i * shape_[1] + j) * shape_[2] + k];
+    ensure_host_data();
+    device_valid_ = false;
+    return h_data_[(i * shape_[1] + j) * shape_[2] + k];
 }
 
 float& Tensor::at(size_t i, size_t j, size_t k, size_t l) {
-    return data_[((i * shape_[1] + j) * shape_[2] + k) * shape_[3] + l];
+    ensure_host_data();
+    device_valid_ = false;
+    return h_data_[((i * shape_[1] + j) * shape_[2] + k) * shape_[3] + l];
 }
 
 const float& Tensor::at(size_t i) const {
-    return data_[i];
+    ensure_host_data();
+    return h_data_[i];
 }
 
 const float& Tensor::at(size_t i, size_t j) const {
-    return data_[i * shape_[1] + j];
+    ensure_host_data();
+    return h_data_[i * shape_[1] + j];
 }
 
 const float& Tensor::at(size_t i, size_t j, size_t k) const {
-    return data_[(i * shape_[1] + j) * shape_[2] + k];
+    ensure_host_data();
+    return h_data_[(i * shape_[1] + j) * shape_[2] + k];
 }
 
 const float& Tensor::at(size_t i, size_t j, size_t k, size_t l) const {
-    return data_[((i * shape_[1] + j) * shape_[2] + k) * shape_[3] + l];
+    ensure_host_data();
+    return h_data_[((i * shape_[1] + j) * shape_[2] + k) * shape_[3] + l];
 }
 
 // Reshape
@@ -170,8 +322,16 @@ Tensor Tensor::view(const std::vector<size_t>& new_shape) const {
         throw std::invalid_argument("New shape must have same number of elements");
     }
 
-    // Create a view that shares data with this tensor (no copy)
-    Tensor result(new_shape, data_, false);  // false means don't copy data
+    // Create a view that shares GPU data with this tensor (no copy)
+    Tensor result;
+    result.shape_ = new_shape;
+    result.size_ = size_;
+    result.d_data_ = d_data_;
+    result.h_data_ = nullptr;
+    result.owns_data_ = false;
+    result.on_gpu_ = on_gpu_;
+    result.host_valid_ = false;
+    result.device_valid_ = device_valid_;
     return result;
 }
 
@@ -184,8 +344,6 @@ Tensor Tensor::load_from_file(const std::string& filename, ModelLoader* loader) 
 
     // Otherwise, if global model loader is available, use it
     if (g_model_loader) {
-        // The filename is the tensor name (e.g., "embed_tokens.weight")
-        // No need to strip anything if properly passed
         return g_model_loader->load_tensor(filename);
     }
 
@@ -210,8 +368,12 @@ Tensor Tensor::load_from_file(const std::string& filename, ModelLoader* loader) 
     // Create tensor
     Tensor tensor(shape);
 
-    // Read data
-    file.read(reinterpret_cast<char*>(tensor.data()), tensor.size() * sizeof(float));
+    // Read data to host first, then copy to device
+    size_t total_size = tensor.size();
+    float* host_buffer = new float[total_size];
+    file.read(reinterpret_cast<char*>(host_buffer), total_size * sizeof(float));
+    CHECK_CUDA(cudaMemcpy(tensor.data(), host_buffer, total_size * sizeof(float), cudaMemcpyHostToDevice));
+    delete[] host_buffer;
 
     file.close();
     return tensor;
@@ -233,29 +395,39 @@ void Tensor::save_to_file(const std::string& filename) const {
         file.write(reinterpret_cast<const char*>(&dim32), sizeof(uint32_t));
     }
 
-    // Write data
-    file.write(reinterpret_cast<const char*>(data_), size_ * sizeof(float));
+    // Sync to host and write data
+    sync_to_host();
+    file.write(reinterpret_cast<const char*>(h_data_), size_ * sizeof(float));
 
     file.close();
 }
 
 // Tensor operations
 Tensor Tensor::copy() const {
-    return Tensor(shape_, data_, true);
+    return Tensor(*this);
 }
 
 void Tensor::fill(float value) {
-    std::fill(data_, data_ + size_, value);
+    if (size_ > 0) {
+        // Allocate host buffer if needed
+        if (h_data_ == nullptr) {
+            h_data_ = new float[size_];
+        }
+        std::fill(h_data_, h_data_ + size_, value);
+        CHECK_CUDA(cudaMemcpy(d_data_, h_data_, size_ * sizeof(float), cudaMemcpyHostToDevice));
+        host_valid_ = true;
+        device_valid_ = true;
+    }
 }
 
 void Tensor::zero() {
-    if (data_ != nullptr && size_ > 0) {
-        std::memset(data_, 0, size_ * sizeof(float));
+    if (d_data_ != nullptr && size_ > 0) {
+        CHECK_CUDA(cudaMemset(d_data_, 0, size_ * sizeof(float)));
+        device_valid_ = true;
+        host_valid_ = false;
     }
 }
 
 void Tensor::ones() {
-    if (data_ != nullptr && size_ > 0) {
-        std::fill(data_, data_ + size_, 1.0f);
-    }
+    fill(1.0f);
 }

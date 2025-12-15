@@ -97,6 +97,9 @@ int main(int argc, char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 
+    // Initialize parallel context (sets GPU device and expert assignment)
+    g_parallel_ctx.init(mpi_rank, mpi_size);
+
     parse_args(argc, argv);
     
     // Configuration
@@ -113,9 +116,9 @@ int main(int argc, char* argv[]) {
     int32_t total_samples = 0;
     int32_t seq_length = 0;
 
-    /* Only MPI process rank 0 has the inputs and outputs */
+    /* Rank 0 reads input file and broadcasts dimensions to all */
     if (mpi_rank == 0) fprintf(stdout, "Initializing inputs and outputs...");
-    
+
     if (mpi_rank == 0) {
         // Read input file to get dimensions and data
         std::ifstream infile(input_file, std::ios::binary);
@@ -132,50 +135,71 @@ int main(int argc, char* argv[]) {
         fprintf(stdout, "  Total samples: %d\n", total_samples);
         fprintf(stdout, "  Sequence length: %d\n", seq_length);
         fprintf(stdout, "  Processing samples: %d\n", num_samples);
+        fprintf(stdout, "  Number of nodes: %d\n", g_parallel_ctx.num_nodes);
+        fprintf(stdout, "  GPUs per node: %d\n", (int)NUM_GPUS_PER_NODE);
         fprintf(stdout, "\n");
 
         // Allocate pinned memory for inputs
         CHECK_CUDA(cudaMallocHost(&inputs, num_samples * seq_length * sizeof(int)));
-        
+
         // Read all input samples into buffer
         for (int i = 0; i < num_samples; i++) {
             std::vector<int32_t> temp_input(seq_length);
             infile.read(reinterpret_cast<char*>(temp_input.data()), seq_length * sizeof(int32_t));
-            
+
             if (!infile && i < num_samples - 1) {
                 fprintf(stderr, "Warning: Could only read %d samples\n", i);
                 break;
             }
-            
+
             // Copy to pinned memory buffer
             for (int j = 0; j < seq_length; j++) {
                 inputs[i * seq_length + j] = static_cast<int>(temp_input[j]);
             }
         }
-        
+
         infile.close();
 
         // Allocate pinned memory for outputs
         CHECK_CUDA(cudaMallocHost(&outputs, num_samples * VOCAB_SIZE * sizeof(float)));
     }
 
+    // Broadcast seq_length to all processes (needed for input allocation)
+    MPI_Bcast(&seq_length, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&num_samples, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // All non-zero ranks allocate input buffer for receiving broadcasts
+    if (mpi_rank != 0) {
+        CHECK_CUDA(cudaMallocHost(&inputs, num_samples * seq_length * sizeof(int)));
+    }
+
+    // Broadcast ALL inputs upfront to all processes for data parallelism
+    // This allows each node to process its samples independently
+    MPI_Bcast(inputs, num_samples * seq_length, MPI_INT, 0, MPI_COMM_WORLD);
+
     // Load model
     if (mpi_rank == 0) fprintf(stdout, "Loading model from %s...", model_file.c_str());
     LFM2Model model(model_file);
 
-    /* Warm-up */
-    if (run_warmup && mpi_rank == 0) {
-        fprintf(stdout, "Warming up...");
+    /* Warm-up - all GPUs must participate for expert parallelism */
+    if (run_warmup) {
+        if (mpi_rank == 0) fprintf(stdout, "Warming up...");
+
+        // All processes already have inputs from upfront broadcast
         std::vector<int> warmup_input(inputs, inputs + seq_length);
+
         Tensor warmup_logits;
         for (int i = 0; i < 3; i++) {
             model.forward(warmup_input, warmup_logits);
         }
-        fprintf(stdout, "Done!\n\n");
+        MPI_Barrier(MPI_COMM_WORLD);
+        if (mpi_rank == 0) fprintf(stdout, "Done!\n\n");
     }
 
     ////////////////////////////////////////////////////////////////////
     // MODEL COMPUTATION                                              //
+    // Expert parallelism: All GPUs in a node process same sample     //
+    // Data parallelism: Different nodes process different samples    //
     ////////////////////////////////////////////////////////////////////
 
     double st = 0.0, et = 0.0;
@@ -185,100 +209,83 @@ int main(int argc, char* argv[]) {
         fflush(stdout);
     }
 
-    for (size_t i = 0; i < 4; i++) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaDeviceSynchronize());
-    }
-    CHECK_CUDA(cudaSetDevice(0));
+    // Synchronize all GPUs
+    CHECK_CUDA(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (mpi_rank == 0) st = get_time();
 
-    // Broadcast seq_length and num_samples to all ranks
-    MPI_Bcast(&seq_length, 1, MPI_INT32_T, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&num_samples, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    // Calculate samples per node for data parallelism
+    int samples_per_node = (num_samples + g_parallel_ctx.num_nodes - 1) / g_parallel_ctx.num_nodes;
+    int my_node_start = g_parallel_ctx.node_rank * samples_per_node;
+    int my_node_end = std::min(my_node_start + samples_per_node, num_samples);
 
-    // Allocate local input/output buffers on non-root ranks
-    int* local_inputs = nullptr;
+    // Allocate local output buffer for this node (only local_rank 0 needs it)
     float* local_outputs = nullptr;
-
-    if (mpi_rank != 0) {
-        CHECK_CUDA(cudaMallocHost(&local_inputs, num_samples * seq_length * sizeof(int)));
-        CHECK_CUDA(cudaMallocHost(&local_outputs, num_samples * VOCAB_SIZE * sizeof(float)));
-    } else {
-        local_inputs = inputs;
-        local_outputs = outputs;
+    int local_num_samples = my_node_end - my_node_start;
+    if (g_parallel_ctx.local_rank == 0 && local_num_samples > 0) {
+        CHECK_CUDA(cudaMallocHost(&local_outputs, local_num_samples * VOCAB_SIZE * sizeof(float)));
     }
 
-    // Broadcast all inputs to all ranks (simpler than scatter for small data)
-    MPI_Bcast(local_inputs, num_samples * seq_length, MPI_INT, 0, MPI_COMM_WORLD);
+    // Process samples assigned to this node
+    // All GPUs in the node work together on each sample (expert parallelism)
+    for (int sample_idx = my_node_start; sample_idx < my_node_end; sample_idx++) {
+        // Each process has all inputs (from upfront broadcast), access directly
+        std::vector<int> input_ids_vec(inputs + sample_idx * seq_length,
+                                       inputs + (sample_idx + 1) * seq_length);
 
-    // Calculate sample distribution for data parallelism
-    int samples_per_rank = num_samples / mpi_size;
-    int extra_samples = num_samples % mpi_size;
-    int my_start = mpi_rank * samples_per_rank + std::min(mpi_rank, extra_samples);
-    int my_count = samples_per_rank + (mpi_rank < extra_samples ? 1 : 0);
-
-    /* Call the main computation - each rank processes its subset of samples */
-    for (int i = 0; i < my_count; i++) {
-        int sample_idx = my_start + i;
-        // Get input for this sample
-        std::vector<int> input_ids_vec(local_inputs + sample_idx * seq_length,
-                                      local_inputs + (sample_idx + 1) * seq_length);
-
-        // Run forward pass
+        // All GPUs run forward pass together (expert parallelism via MPI_Allreduce in MoE)
         Tensor logits;
         model.forward(input_ids_vec, logits);
 
-        // Copy logits to local output buffer
-        for (size_t j = 0; j < VOCAB_SIZE; j++) {
-            local_outputs[sample_idx * VOCAB_SIZE + j] = logits.at(0, j);
+        // Only local_rank 0 of each node stores the output
+        if (g_parallel_ctx.local_rank == 0) {
+            int local_sample_idx = sample_idx - my_node_start;
+            logits.sync_to_host();
+            for (size_t i = 0; i < VOCAB_SIZE; i++) {
+                local_outputs[local_sample_idx * VOCAB_SIZE + i] = logits.at(0, i);
+            }
         }
     }
 
-    // Reduce outputs to rank 0 (each rank contributes its computed outputs)
-    if (mpi_size > 1) {
-        // Each rank has computed its portion; we need to gather
-        // Use MPI_Reduce with MPI_SUM on each position (only owner has non-zero)
-        // First zero out positions not computed by this rank
-        if (mpi_rank != 0) {
-            for (int s = 0; s < num_samples; s++) {
-                if (s < my_start || s >= my_start + my_count) {
-                    for (size_t j = 0; j < VOCAB_SIZE; j++) {
-                        local_outputs[s * VOCAB_SIZE + j] = 0.0f;
-                    }
-                }
-            }
-        } else {
-            // Rank 0 zeros out its non-computed positions
-            for (int s = 0; s < num_samples; s++) {
-                if (s < my_start || s >= my_start + my_count) {
-                    for (size_t j = 0; j < VOCAB_SIZE; j++) {
-                        outputs[s * VOCAB_SIZE + j] = 0.0f;
-                    }
-                }
-            }
-        }
+    // Gather outputs from all nodes to rank 0
+    if (g_parallel_ctx.num_nodes > 1) {
+        // Create communicator for local_rank 0 processes only (one per node)
+        MPI_Comm node_leaders_comm;
+        int color = (g_parallel_ctx.local_rank == 0) ? 0 : MPI_UNDEFINED;
+        MPI_Comm_split(MPI_COMM_WORLD, color, g_parallel_ctx.node_rank, &node_leaders_comm);
 
-        // Reduce all outputs to rank 0
-        if (mpi_rank == 0) {
-            MPI_Reduce(MPI_IN_PLACE, outputs, num_samples * VOCAB_SIZE, MPI_FLOAT, MPI_SUM, 0, MPI_COMM_WORLD);
-        } else {
-            MPI_Reduce(local_outputs, nullptr, num_samples * VOCAB_SIZE, MPI_FLOAT, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (g_parallel_ctx.local_rank == 0 && node_leaders_comm != MPI_COMM_NULL) {
+            // Gather all outputs to rank 0
+            std::vector<int> recv_counts(g_parallel_ctx.num_nodes);
+            std::vector<int> displs(g_parallel_ctx.num_nodes);
+
+            for (int n = 0; n < g_parallel_ctx.num_nodes; n++) {
+                int node_start = n * samples_per_node;
+                int node_end = std::min(node_start + samples_per_node, num_samples);
+                recv_counts[n] = (node_end - node_start) * VOCAB_SIZE;
+                displs[n] = node_start * VOCAB_SIZE;
+            }
+
+            MPI_Gatherv(local_outputs, local_num_samples * VOCAB_SIZE, MPI_FLOAT,
+                        outputs, recv_counts.data(), displs.data(), MPI_FLOAT,
+                        0, node_leaders_comm);
+
+            MPI_Comm_free(&node_leaders_comm);
+        }
+    } else {
+        // Single node: just copy local outputs to outputs
+        if (mpi_rank == 0 && local_outputs != nullptr) {
+            std::memcpy(outputs, local_outputs, local_num_samples * VOCAB_SIZE * sizeof(float));
         }
     }
 
-    // Free local buffers on non-root ranks
-    if (mpi_rank != 0) {
-        CHECK_CUDA(cudaFreeHost(local_inputs));
+    // Free local output buffer
+    if (local_outputs != nullptr) {
         CHECK_CUDA(cudaFreeHost(local_outputs));
     }
 
-    for (size_t i = 0; i < 4; i++) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaDeviceSynchronize());
-    }
-    CHECK_CUDA(cudaSetDevice(0));
+    CHECK_CUDA(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
@@ -404,11 +411,16 @@ int main(int argc, char* argv[]) {
         }
 
         // Free pinned memory
-        CHECK_CUDA(cudaFreeHost(inputs));
         CHECK_CUDA(cudaFreeHost(outputs));
     }
 
-    /* MPI Finalization */
+    // Free input buffer (allocated by all processes)
+    if (inputs != nullptr) {
+        CHECK_CUDA(cudaFreeHost(inputs));
+    }
+
+    /* Parallel context and MPI Finalization */
+    g_parallel_ctx.finalize();
     MPI_Finalize();
     return 0;
 }

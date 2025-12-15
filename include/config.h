@@ -26,6 +26,10 @@ constexpr float ROUTED_SCALING_FACTOR = 1.0f;
 constexpr bool NORM_TOPK_PROB = true;
 constexpr bool USE_EXPERT_BIAS = true;
 
+// Parallelism Configuration
+constexpr size_t NUM_GPUS_PER_NODE = 4;
+constexpr size_t NUM_EXPERTS_PER_GPU = NUM_EXPERTS / NUM_GPUS_PER_NODE;  // 8 experts per GPU
+
 // Conv Configuration
 constexpr size_t CONV_L_CACHE = 3;  // Kernel size for causal conv
 constexpr bool USE_CONV_BIAS = false;

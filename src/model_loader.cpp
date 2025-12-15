@@ -1,6 +1,7 @@
 #include "model_loader.h"
 #include <stdexcept>
 #include <iostream>
+#include <cuda_runtime.h>
 
 ModelLoader::ModelLoader(const std::string& model_file) : model_file_(model_file) {
     load_index();
@@ -60,23 +61,30 @@ Tensor ModelLoader::load_tensor(const std::string& name) {
     if (it == index_.end()) {
         throw std::runtime_error("Tensor not found: " + name);
     }
-    
+
     const TensorInfo& info = it->second;
-    
-    // Create tensor with shape
+
+    // Create tensor with shape (allocates on GPU)
     Tensor tensor(info.shape);
-    
+
     // Open file and seek to tensor data
     std::ifstream file(model_file_, std::ios::binary);
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open model file: " + model_file_);
     }
-    
+
+    // Read to host buffer first, then copy to GPU
+    size_t num_elements = info.size / sizeof(float);
+    float* host_buffer = new float[num_elements];
+
     file.seekg(info.offset);
-    file.read(reinterpret_cast<char*>(tensor.data()), info.size);
-    
+    file.read(reinterpret_cast<char*>(host_buffer), info.size);
     file.close();
-    
+
+    // Copy to GPU
+    CHECK_CUDA(cudaMemcpy(tensor.data(), host_buffer, info.size, cudaMemcpyHostToDevice));
+    delete[] host_buffer;
+
     return tensor;
 }
 

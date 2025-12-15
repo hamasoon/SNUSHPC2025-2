@@ -10,11 +10,7 @@ class RMSNorm {
 public:
     RMSNorm(const std::string& weight_file);
     void forward(const Tensor& x, Tensor& y);
-
-    // Getter for weight (needed for GPU kernels)
-    const Tensor& weight() const { return weight_; }
-    Tensor& weight() { return weight_; }
-
+    
 private:
     Tensor weight_;
 };
@@ -35,45 +31,29 @@ private:
 class MLP {
 public:
     MLP(const std::string& w1_file, const std::string& w2_file, const std::string& w3_file);
-    ~MLP();
-
-    // Delete copy (GPU pointers would be double-freed)
-    MLP(const MLP&) = delete;
-    MLP& operator=(const MLP&) = delete;
-
-    // Move constructor
-    MLP(MLP&& other) noexcept;
-    MLP& operator=(MLP&& other) noexcept;
-
     void forward(const Tensor& x, Tensor& y);
-
-    // Getters for weights (needed for batched multi-GPU MoE processing)
-    const Tensor& w1() const { return w1_; }
-    const Tensor& w2() const { return w2_; }
-    const Tensor& w3() const { return w3_; }
-
+    
 private:
     Tensor w1_;  // up projection
     Tensor w3_;  // gate projection
     Tensor w2_;  // down projection
-
-    // Persistent GPU weights
-    float* d_w1_ = nullptr;
-    float* d_w2_ = nullptr;
-    float* d_w3_ = nullptr;
 };
 
-// Sparse MoE Block
+// Sparse MoE Block with Expert Parallelism
 class SparseMoeBlock {
 public:
     SparseMoeBlock(int layer_idx);
     void forward(const Tensor& x, Tensor& y, Tensor& router_logits);
-    
+
 private:
-    Tensor gate_;  // router
-    std::vector<MLP> experts_;
-    Tensor expert_bias_;  // optional
-    
+    Tensor gate_;  // router (replicated on all GPUs)
+    std::vector<MLP> local_experts_;  // Only local experts for this GPU
+    Tensor expert_bias_;  // optional (replicated)
+    int layer_idx_;
+
+    // Maps local expert index to global expert index
+    std::vector<int> local_to_global_expert_;
+
     void route_tokens(const Tensor& router_logits, std::vector<int>& top_k_indices,
                      std::vector<float>& top_k_weights);
 };

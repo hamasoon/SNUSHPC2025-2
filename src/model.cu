@@ -8,929 +8,423 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <mpi.h>
-#include <omp.h>
 
 // Global model loader (definition)
 std::unique_ptr<ModelLoader> g_model_loader;
 
-// MPI context
-static int g_mpi_rank = 0;
-static int g_mpi_size = 1;
+// Global parallel context
+ParallelContext g_parallel_ctx;
 
 // ============================================================================
-// GPU Memory Management and Multi-GPU Support
+// Parallel Context Implementation
 // ============================================================================
 
-#define NUM_GPUS 4
-#define EXPERTS_PER_GPU (NUM_EXPERTS / NUM_GPUS)
-#define TILE_SIZE 32
+void ParallelContext::init(int rank, int size) {
+    world_rank = rank;
+    world_size = size;
+
+    // Determine local rank within node (assuming 4 GPUs per node)
+    local_rank = rank % NUM_GPUS_PER_NODE;
+    node_rank = rank / NUM_GPUS_PER_NODE;
+    num_nodes = (size + NUM_GPUS_PER_NODE - 1) / NUM_GPUS_PER_NODE;
+
+    // Create communicator for processes within same node
+    MPI_Comm_split(MPI_COMM_WORLD, node_rank, local_rank, &node_comm);
+
+    // Set GPU device based on local rank
+    CHECK_CUDA(cudaSetDevice(local_rank));
+
+    // Create CUDA streams for async operations
+    CHECK_CUDA(cudaStreamCreate(&compute_stream));
+    CHECK_CUDA(cudaStreamCreate(&h2d_stream));
+    CHECK_CUDA(cudaStreamCreate(&d2h_stream));
+
+    // Calculate expert assignment for this GPU
+    expert_start = local_rank * NUM_EXPERTS_PER_GPU;
+    expert_end = expert_start + NUM_EXPERTS_PER_GPU;
+
+    if (world_rank == 0) {
+        std::cout << "Parallel Context Initialized:" << std::endl;
+        std::cout << "  World size: " << world_size << std::endl;
+        std::cout << "  Num nodes: " << num_nodes << std::endl;
+        std::cout << "  GPUs per node: " << NUM_GPUS_PER_NODE << std::endl;
+        std::cout << "  Experts per GPU: " << NUM_EXPERTS_PER_GPU << std::endl;
+    }
+}
+
+void ParallelContext::finalize() {
+    // Destroy CUDA streams
+    CHECK_CUDA(cudaStreamDestroy(compute_stream));
+    CHECK_CUDA(cudaStreamDestroy(h2d_stream));
+    CHECK_CUDA(cudaStreamDestroy(d2h_stream));
+
+    MPI_Comm_free(&node_comm);
+}
+
+// ============================================================================
+// CUDA Kernels for Model Operations
+// ============================================================================
+
 #define BLOCK_SIZE 256
-#define FLASH_ATTN_BLOCK_SIZE 64
+#define TILE_SIZE 16
 
-// ============================================================================
-// OPTIMIZATION 1.3: Memory Pool Allocator Implementation
-// ============================================================================
+// Embedding lookup kernel
+__global__ void embedding_lookup_kernel(const float* embed_table, const int* input_ids,
+                                         float* output, size_t seq_len, size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = seq_len * hidden_size;
 
-GPUMemoryPool& GPUMemoryPool::instance() {
-    static GPUMemoryPool inst;
-    return inst;
-}
-
-void GPUMemoryPool::init(size_t pool_size) {
-    if (initialized_) return;
-
-    pool_size_ = pool_size;
-    cudaMalloc(&pool_, pool_size_);
-    current_offset_ = 0;
-    initialized_ = true;
-
-    if (g_mpi_rank == 0) {
-        std::cout << "  GPU Memory Pool initialized: " << (pool_size / (1024*1024)) << " MB" << std::endl;
+    if (idx < total) {
+        size_t pos = idx / hidden_size;
+        size_t dim = idx % hidden_size;
+        int token_id = input_ids[pos];
+        output[idx] = embed_table[token_id * hidden_size + dim];
     }
 }
 
-void* GPUMemoryPool::allocate(size_t size) {
-    // Align to 256 bytes for coalesced access
-    size = ((size + 255) / 256) * 256;
+// Tensor transpose kernel: (batch, seq_len, num_heads, head_dim) -> (batch, num_heads, seq_len, head_dim)
+__global__ void transpose_0213_kernel(const float* input, float* output,
+                                       size_t batch, size_t seq_len, size_t num_heads, size_t head_dim) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * num_heads * seq_len * head_dim;
 
-    if (current_offset_ + size > pool_size_) {
-        std::cerr << "GPU Memory Pool exhausted! Requested: " << size
-                  << ", Available: " << (pool_size_ - current_offset_) << std::endl;
-        return nullptr;
+    if (idx < total) {
+        size_t d = idx % head_dim;
+        size_t remaining = idx / head_dim;
+        size_t s = remaining % seq_len;
+        remaining = remaining / seq_len;
+        size_t h = remaining % num_heads;
+        size_t b = remaining / num_heads;
+
+        size_t in_idx = ((b * seq_len + s) * num_heads + h) * head_dim + d;
+        output[idx] = input[in_idx];
     }
-
-    void* ptr = reinterpret_cast<char*>(pool_) + current_offset_;
-    current_offset_ += size;
-    return ptr;
 }
 
-void GPUMemoryPool::reset() {
-    current_offset_ = 0;
-}
+// Reshape projection output kernel
+__global__ void reshape_proj_output_kernel(const float* input, float* output,
+                                            size_t batch, size_t seq_len, size_t num_heads, size_t head_dim) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * seq_len * num_heads * head_dim;
 
-void GPUMemoryPool::free_all() {
-    if (pool_) {
-        cudaFree(pool_);
-        pool_ = nullptr;
+    if (idx < total) {
+        size_t d = idx % head_dim;
+        size_t remaining = idx / head_dim;
+        size_t h = remaining % num_heads;
+        remaining = remaining / num_heads;
+        size_t s = remaining % seq_len;
+        size_t b = remaining / seq_len;
+
+        size_t in_idx = (b * seq_len + s) * (num_heads * head_dim) + h * head_dim + d;
+        output[idx] = input[in_idx];
     }
-    pool_size_ = 0;
-    current_offset_ = 0;
-    initialized_ = false;
 }
 
-GPUMemoryPool::~GPUMemoryPool() {
-    free_all();
+// Flatten attention output kernel
+__global__ void flatten_attn_output_kernel(const float* input, float* output,
+                                            size_t batch, size_t num_heads, size_t seq_len, size_t head_dim) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * seq_len * num_heads * head_dim;
+
+    if (idx < total) {
+        size_t flat_idx = idx;
+        size_t hidden_size = num_heads * head_dim;
+        size_t token_idx = flat_idx / hidden_size;
+        size_t h_d = flat_idx % hidden_size;
+        size_t h = h_d / head_dim;
+        size_t d = h_d % head_dim;
+
+        size_t b = token_idx / seq_len;
+        size_t s = token_idx % seq_len;
+
+        size_t in_idx = ((b * num_heads + h) * seq_len + s) * head_dim + d;
+        output[flat_idx] = input[in_idx];
+    }
 }
 
-// ============================================================================
-// OPTIMIZATION 1.1: Persistent GPU Weights Implementation
-// ============================================================================
+// Batched attention scores kernel
+__global__ void batched_attn_scores_kernel(const float* q, const float* k, float* scores,
+                                            size_t batch, size_t num_heads, size_t seq_len,
+                                            size_t head_dim, float scale) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * num_heads * seq_len * seq_len;
 
-PersistentGPUWeights& PersistentGPUWeights::instance() {
-    static PersistentGPUWeights inst;
-    return inst;
+    if (idx < total) {
+        size_t j = idx % seq_len;
+        size_t remaining = idx / seq_len;
+        size_t i = remaining % seq_len;
+        remaining = remaining / seq_len;
+        size_t h = remaining % num_heads;
+        size_t b = remaining / num_heads;
+
+        float sum = 0.0f;
+        for (size_t d = 0; d < head_dim; d++) {
+            sum += q[((b * num_heads + h) * seq_len + i) * head_dim + d] *
+                   k[((b * num_heads + h) * seq_len + j) * head_dim + d];
+        }
+        scores[idx] = sum * scale;
+    }
 }
 
-PersistentGPUWeights::~PersistentGPUWeights() {
-    if (d_embed_tokens_) cudaFree(d_embed_tokens_);
-    if (d_lm_head_) cudaFree(d_lm_head_);
-    if (d_final_norm_weight_) cudaFree(d_final_norm_weight_);
+// Apply causal mask kernel
+__global__ void apply_causal_mask_kernel(float* scores, size_t batch, size_t num_heads, size_t seq_len) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * num_heads * seq_len * seq_len;
 
-    for (auto& lw : layer_weights_) {
-        // Attention weights
-        if (lw.q_proj) cudaFree(lw.q_proj);
-        if (lw.k_proj) cudaFree(lw.k_proj);
-        if (lw.v_proj) cudaFree(lw.v_proj);
-        if (lw.o_proj) cudaFree(lw.o_proj);
-        if (lw.q_ln_weight) cudaFree(lw.q_ln_weight);
-        if (lw.k_ln_weight) cudaFree(lw.k_ln_weight);
+    if (idx < total) {
+        size_t j = idx % seq_len;
+        size_t remaining = idx / seq_len;
+        size_t i = remaining % seq_len;
 
-        // Conv weights
-        if (lw.conv_weight) cudaFree(lw.conv_weight);
-        if (lw.in_proj_weight) cudaFree(lw.in_proj_weight);
-        if (lw.out_proj_weight) cudaFree(lw.out_proj_weight);
-        if (lw.conv_bias) cudaFree(lw.conv_bias);
-        if (lw.in_proj_bias) cudaFree(lw.in_proj_bias);
-        if (lw.out_proj_bias) cudaFree(lw.out_proj_bias);
-
-        // Norm weights
-        if (lw.input_ln_weight) cudaFree(lw.input_ln_weight);
-        if (lw.post_attn_ln_weight) cudaFree(lw.post_attn_ln_weight);
-
-        // MLP weights
-        if (lw.mlp_w1) cudaFree(lw.mlp_w1);
-        if (lw.mlp_w2) cudaFree(lw.mlp_w2);
-        if (lw.mlp_w3) cudaFree(lw.mlp_w3);
-
-        // MoE weights
-        if (lw.gate) cudaFree(lw.gate);
-        if (lw.expert_bias) cudaFree(lw.expert_bias);
-        for (auto& exp : lw.experts) {
-            if (exp.w1) cudaFree(exp.w1);
-            if (exp.w2) cudaFree(exp.w2);
-            if (exp.w3) cudaFree(exp.w3);
+        if (j > i) {
+            scores[idx] = -INFINITY;
         }
     }
 }
 
-// GPU weight storage
-struct GPUWeights {
-    float* data;
-    size_t size;
-    int gpu_id;
-};
+// Batched softmax kernel for attention
+__global__ void batched_softmax_kernel(float* scores, size_t batch, size_t num_heads, size_t seq_len) {
+    extern __shared__ float shared[];
 
-// Per-GPU context
-struct GPUContext {
-    cudaStream_t stream;
-    float* workspace;
-    size_t workspace_size;
-};
+    size_t bh = blockIdx.x;
+    size_t i = blockIdx.y;
+    if (bh >= batch * num_heads || i >= seq_len) return;
 
-static GPUContext g_gpu_ctx[NUM_GPUS];
-static bool g_multi_gpu_initialized = false;
+    float* row = scores + (bh * seq_len + i) * seq_len;
 
-// Initialize multi-GPU setup with MPI awareness
-void init_multi_gpu() {
-    if (g_multi_gpu_initialized) return;
-
-    // Get MPI rank and size
-    MPI_Comm_rank(MPI_COMM_WORLD, &g_mpi_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &g_mpi_size);
-
-    int device_count;
-    cudaGetDeviceCount(&device_count);
-
-    for (int i = 0; i < NUM_GPUS && i < device_count; i++) {
-        cudaSetDevice(i);
-        cudaStreamCreate(&g_gpu_ctx[i].stream);
-
-        // Allocate workspace (enough for largest intermediate tensor)
-        g_gpu_ctx[i].workspace_size = 256 * 1024 * 1024;  // 256MB per GPU
-        cudaMalloc(&g_gpu_ctx[i].workspace, g_gpu_ctx[i].workspace_size);
-    }
-
-    // Enable peer access for direct GPU-to-GPU communication
-    for (int i = 0; i < NUM_GPUS && i < device_count; i++) {
-        cudaSetDevice(i);
-        for (int j = 0; j < NUM_GPUS && j < device_count; j++) {
-            if (i != j) {
-                int can_access;
-                cudaDeviceCanAccessPeer(&can_access, i, j);
-                if (can_access) {
-                    cudaDeviceEnablePeerAccess(j, 0);
-                }
-            }
-        }
-    }
-
-    cudaSetDevice(0);
-    g_multi_gpu_initialized = true;
-}
-
-// ============================================================================
-// CUDA Kernels (static to avoid linker conflicts with layer.cu)
-// ============================================================================
-
-// Tiled matrix multiplication: C = A @ B^T
-static __global__ void matmul_kernel(const float* __restrict__ A,
-                              const float* __restrict__ B,
-                              float* __restrict__ C,
-                              int M, int N, int K) {
-    __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
-    __shared__ float tile_B[TILE_SIZE][TILE_SIZE];
-
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-
-    float sum = 0.0f;
-    int num_tiles = (K + TILE_SIZE - 1) / TILE_SIZE;
-
-    for (int t = 0; t < num_tiles; t++) {
-        int tile_col = t * TILE_SIZE + threadIdx.x;
-        int tile_row = t * TILE_SIZE + threadIdx.y;
-
-        tile_A[threadIdx.y][threadIdx.x] = (row < M && tile_col < K) ? A[row * K + tile_col] : 0.0f;
-        tile_B[threadIdx.y][threadIdx.x] = (col < N && tile_row < K) ? B[col * K + tile_row] : 0.0f;
-
-        __syncthreads();
-
-        #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum += tile_A[threadIdx.y][k] * tile_B[k][threadIdx.x];
-        }
-
-        __syncthreads();
-    }
-
-    if (row < M && col < N) {
-        C[row * N + col] = sum;
-    }
-}
-// SiLU activation kernel
-static __global__ void silu_kernel(const float* __restrict__ input,
-                            float* __restrict__ output, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        float x = input[idx];
-        output[idx] = x * (1.0f / (1.0f + expf(-x)));
-    }
-}
-
-// Element-wise multiply kernel
-static __global__ void mul_kernel(const float* __restrict__ a,
-                           const float* __restrict__ b,
-                           float* __restrict__ c, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        c[idx] = a[idx] * b[idx];
-    }
-}
-
-// Attention score computation: scores[i,j] = sum_d Q[i,d] * K[j,d]
-static __global__ void attention_scores_kernel(const float* __restrict__ Q,
-                                        const float* __restrict__ K,
-                                        float* __restrict__ scores,
-                                        int seq_len, int head_dim, float scale) {
-    int i = blockIdx.y;
-    int j = blockIdx.x;
-
-    if (i >= seq_len || j >= seq_len) return;
-
-    float sum = 0.0f;
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        sum += Q[i * head_dim + d] * K[j * head_dim + d];
-    }
-
-    // Warp reduction
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
-    }
-
-    if (threadIdx.x == 0) {
-        scores[i * seq_len + j] = sum * scale;
-    }
-}
-
-// Causal softmax kernel
-static __global__ void causal_softmax_kernel(float* __restrict__ scores,
-                                      int seq_len) {
-    int i = blockIdx.x;
-    if (i >= seq_len) return;
-
-    float* row = scores + i * seq_len;
-
-    // Apply causal mask and find max
     float max_val = -INFINITY;
-    for (int j = threadIdx.x; j <= i; j += blockDim.x) {
+    for (size_t j = threadIdx.x; j < seq_len; j += blockDim.x) {
         max_val = fmaxf(max_val, row[j]);
     }
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
-    }
-
-    __shared__ float shared_max;
-    if (threadIdx.x == 0) shared_max = max_val;
+    shared[threadIdx.x] = max_val;
     __syncthreads();
-    max_val = shared_max;
 
-    // Compute exp and sum
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    max_val = shared[0];
+    __syncthreads();
+
     float sum = 0.0f;
-    for (int j = threadIdx.x; j <= i; j += blockDim.x) {
+    for (size_t j = threadIdx.x; j < seq_len; j += blockDim.x) {
         float exp_val = expf(row[j] - max_val);
         row[j] = exp_val;
         sum += exp_val;
     }
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
-    }
-
-    __shared__ float shared_sum;
-    if (threadIdx.x == 0) shared_sum = sum;
-    __syncthreads();
-    sum = shared_sum;
-
-    // Normalize
-    float sum_inv = 1.0f / sum;
-    for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
-        row[j] = (j <= i) ? (row[j] * sum_inv) : 0.0f;
-    }
-}
-
-// Attention output: out[i,d] = sum_j scores[i,j] * V[j,d]
-static __global__ void attention_output_kernel(const float* __restrict__ scores,
-                                        const float* __restrict__ V,
-                                        float* __restrict__ output,
-                                        int seq_len, int head_dim) {
-    int i = blockIdx.y;
-    int d = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i >= seq_len || d >= head_dim) return;
-
-    float sum = 0.0f;
-    for (int j = 0; j < seq_len; j++) {
-        sum += scores[i * seq_len + j] * V[j * head_dim + d];
-    }
-    output[i * head_dim + d] = sum;
-}
-
-// ============================================================================
-// OPTIMIZATION 2.1: Flash Attention Kernel
-// Implements Flash Attention with tiling for O(N) memory and better cache utilization
-// Reference: FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness
-// ============================================================================
-
-// Flash Attention forward kernel with online softmax
-// Each block processes one query position with tiled K,V access
-static __global__ void flash_attention_kernel(
-    const float* __restrict__ Q,      // (seq_len, head_dim)
-    const float* __restrict__ K,      // (seq_len, head_dim)
-    const float* __restrict__ V,      // (seq_len, head_dim)
-    float* __restrict__ O,            // (seq_len, head_dim)
-    int seq_len, int head_dim, float scale) {
-
-    // Block handles one query position
-    int query_pos = blockIdx.x;
-    if (query_pos >= seq_len) return;
-
-    // Shared memory for K and V tiles
-    extern __shared__ float smem[];
-    float* K_tile = smem;                                    // FLASH_ATTN_BLOCK_SIZE * head_dim
-    float* V_tile = K_tile + FLASH_ATTN_BLOCK_SIZE * head_dim;  // FLASH_ATTN_BLOCK_SIZE * head_dim
-
-    // Thread-local accumulators
-    float m_i = -INFINITY;  // Running max
-    float l_i = 0.0f;       // Running sum of exp
-    float acc[64];          // Output accumulator (assuming head_dim <= 64)
-
-    // Initialize accumulator
-    for (int d = 0; d < head_dim; d++) {
-        acc[d] = 0.0f;
-    }
-
-    // Load query into registers
-    float q_reg[64];
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        q_reg[d] = Q[query_pos * head_dim + d];
-    }
+    shared[threadIdx.x] = sum;
     __syncthreads();
 
-    // Causal masking: only attend to positions <= query_pos
-    int max_key_pos = query_pos + 1;  // Causal: only attend up to and including current position
-
-    // Process K,V in tiles
-    for (int tile_start = 0; tile_start < max_key_pos; tile_start += FLASH_ATTN_BLOCK_SIZE) {
-        int tile_end = min(tile_start + FLASH_ATTN_BLOCK_SIZE, max_key_pos);
-        int tile_size = tile_end - tile_start;
-
-        // Load K tile into shared memory
-        for (int i = threadIdx.x; i < tile_size * head_dim; i += blockDim.x) {
-            int local_pos = i / head_dim;
-            int d = i % head_dim;
-            int global_pos = tile_start + local_pos;
-            K_tile[local_pos * head_dim + d] = K[global_pos * head_dim + d];
-        }
-
-        // Load V tile into shared memory
-        for (int i = threadIdx.x; i < tile_size * head_dim; i += blockDim.x) {
-            int local_pos = i / head_dim;
-            int d = i % head_dim;
-            int global_pos = tile_start + local_pos;
-            V_tile[local_pos * head_dim + d] = V[global_pos * head_dim + d];
-        }
-        __syncthreads();
-
-        // Compute attention scores for this tile and update online softmax
-        if (threadIdx.x == 0) {
-            for (int j = 0; j < tile_size; j++) {
-                // Compute Q @ K^T for position j
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; d++) {
-                    score += q_reg[d] * K_tile[j * head_dim + d];
-                }
-                score *= scale;
-
-                // Online softmax update
-                float m_new = fmaxf(m_i, score);
-                float exp_diff = expf(m_i - m_new);
-                float exp_score = expf(score - m_new);
-
-                // Rescale previous accumulator
-                l_i = l_i * exp_diff + exp_score;
-
-                // Update accumulator with new value
-                for (int d = 0; d < head_dim; d++) {
-                    acc[d] = acc[d] * exp_diff + exp_score * V_tile[j * head_dim + d];
-                }
-
-                m_i = m_new;
-            }
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared[threadIdx.x] += shared[threadIdx.x + s];
         }
         __syncthreads();
     }
+    sum = shared[0];
+    __syncthreads();
 
-    // Normalize output by l_i and write to global memory
-    if (threadIdx.x == 0) {
-        float l_inv = 1.0f / l_i;
-        for (int d = 0; d < head_dim; d++) {
-            O[query_pos * head_dim + d] = acc[d] * l_inv;
-        }
+    float inv_sum = 1.0f / sum;
+    for (size_t j = threadIdx.x; j < seq_len; j += blockDim.x) {
+        row[j] *= inv_sum;
     }
 }
 
-// ============================================================================
-// OPTIMIZATION 2.1: Fused ShortConv Kernels
-// ============================================================================
+// Batched attention output kernel
+__global__ void batched_attn_output_kernel(const float* weights, const float* v, float* output,
+                                            size_t batch, size_t num_heads, size_t seq_len, size_t head_dim) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * num_heads * seq_len * head_dim;
 
-// Fused kernel: transpose (batch, seq_len, 3*hidden) -> (batch, 3*hidden, seq_len)
-// and split into B, C, x_gate
-static __global__ void fused_transpose_split_kernel(
-    const float* __restrict__ in_proj_out,  // (batch*seq_len, 3*hidden_size)
-    float* __restrict__ B,                   // (batch, hidden_size, seq_len)
-    float* __restrict__ C,                   // (batch, hidden_size, seq_len)
-    float* __restrict__ x_gate,              // (batch, hidden_size, seq_len)
-    int batch, int seq_len, int hidden_size) {
+    if (idx < total) {
+        size_t d = idx % head_dim;
+        size_t remaining = idx / head_dim;
+        size_t i = remaining % seq_len;
+        remaining = remaining / seq_len;
+        size_t h = remaining % num_heads;
+        size_t b = remaining / num_heads;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * hidden_size * seq_len;
-
-    if (idx >= total) return;
-
-    int s = idx % seq_len;
-    int h = (idx / seq_len) % hidden_size;
-    int b = idx / (hidden_size * seq_len);
-
-    // Input layout: (batch*seq_len, 3*hidden_size)
-    int in_base = (b * seq_len + s) * 3 * hidden_size;
-
-    // Output layout: (batch, hidden_size, seq_len)
-    int out_idx = (b * hidden_size + h) * seq_len + s;
-
-    B[out_idx] = in_proj_out[in_base + h];
-    C[out_idx] = in_proj_out[in_base + h + hidden_size];
-    x_gate[out_idx] = in_proj_out[in_base + h + 2 * hidden_size];
-}
-
-// Fused kernel: Bx = B * x_gate, then causal conv1d
-static __global__ void fused_mul_conv1d_kernel(
-    const float* __restrict__ B,
-    const float* __restrict__ x_gate,
-    const float* __restrict__ conv_weight,  // (hidden_size, kernel_size)
-    float* __restrict__ conv_out,
-    int batch, int hidden_size, int seq_len, int kernel_size) {
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * hidden_size * seq_len;
-
-    if (idx >= total) return;
-
-    int s = idx % seq_len;
-    int h = (idx / seq_len) % hidden_size;
-    int b = idx / (hidden_size * seq_len);
-
-    float sum = 0.0f;
-    for (int k = 0; k < kernel_size; k++) {
-        int input_pos = s - (kernel_size - 1) + k;
-        if (input_pos >= 0) {
-            int input_idx = (b * hidden_size + h) * seq_len + input_pos;
-            // Fused: B * x_gate then conv
-            float bx_val = B[input_idx] * x_gate[input_idx];
-            sum += bx_val * conv_weight[h * kernel_size + k];
+        float sum = 0.0f;
+        for (size_t j = 0; j < seq_len; j++) {
+            sum += weights[(b * num_heads + h) * seq_len * seq_len + i * seq_len + j] *
+                   v[((b * num_heads + h) * seq_len + j) * head_dim + d];
         }
+        output[idx] = sum;
     }
-    conv_out[idx] = sum;
 }
 
-// Fused kernel: y_pre = C * conv_out, then transpose to (batch, seq_len, hidden)
-static __global__ void fused_mul_transpose_kernel(
-    const float* __restrict__ C,
-    const float* __restrict__ conv_out,
-    float* __restrict__ output,  // (batch, seq_len, hidden_size)
-    int batch, int seq_len, int hidden_size) {
+// Transpose for conv
+__global__ void transpose_conv_kernel(const float* input, float* output,
+                                       size_t batch, size_t seq_len, size_t channels) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * channels * seq_len;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * seq_len * hidden_size;
+    if (idx < total) {
+        size_t s = idx % seq_len;
+        size_t remaining = idx / seq_len;
+        size_t c = remaining % channels;
+        size_t b = remaining / channels;
 
-    if (idx >= total) return;
+        size_t in_idx = (b * seq_len + s) * channels + c;
+        output[idx] = input[in_idx];
+    }
+}
 
-    int h = idx % hidden_size;
-    int s = (idx / hidden_size) % seq_len;
-    int b = idx / (seq_len * hidden_size);
+// Reverse transpose for conv
+__global__ void transpose_conv_reverse_kernel(const float* input, float* output,
+                                               size_t batch, size_t channels, size_t seq_len) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * seq_len * channels;
 
-    // Input layout: (batch, hidden_size, seq_len)
-    int input_idx = (b * hidden_size + h) * seq_len + s;
+    if (idx < total) {
+        size_t c = idx % channels;
+        size_t remaining = idx / channels;
+        size_t s = remaining % seq_len;
+        size_t b = remaining / seq_len;
 
-    // Output layout: (batch, seq_len, hidden_size)
-    output[idx] = C[input_idx] * conv_out[input_idx];
+        size_t in_idx = (b * channels + c) * seq_len + s;
+        output[idx] = input[in_idx];
+    }
 }
 
 // Add bias kernel
-static __global__ void add_bias_kernel(
-    float* __restrict__ data,
-    const float* __restrict__ bias,
-    int rows, int cols) {
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= rows * cols) return;
-
-    int col = idx % cols;
-    data[idx] += bias[col];
+__global__ void add_bias_kernel(float* data, const float* bias, size_t rows, size_t cols) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < rows * cols) {
+        size_t col = idx % cols;
+        data[idx] += bias[col];
+    }
 }
 
-// ============================================================================
-// OPTIMIZATION 2.3: Embedding Lookup GPU Kernel
-// ============================================================================
+// Split BCx kernel
+__global__ void split_bcx_kernel(const float* bcx, float* B, float* C, float* x_gate,
+                                  size_t batch, size_t hidden_size, size_t seq_len) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * hidden_size * seq_len;
 
-static __global__ void embedding_lookup_kernel(
-    const int* __restrict__ tokens,
-    const float* __restrict__ embed_table,
-    float* __restrict__ output,
-    int seq_len, int hidden_size) {
+    if (idx < total) {
+        size_t s = idx % seq_len;
+        size_t remaining = idx / seq_len;
+        size_t h = remaining % hidden_size;
+        size_t b = remaining / hidden_size;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = seq_len * hidden_size;
+        size_t bcx_idx_B = (b * 3 * hidden_size + h) * seq_len + s;
+        size_t bcx_idx_C = (b * 3 * hidden_size + h + hidden_size) * seq_len + s;
+        size_t bcx_idx_x = (b * 3 * hidden_size + h + 2 * hidden_size) * seq_len + s;
 
-    if (idx >= total) return;
-
-    int s = idx / hidden_size;
-    int d = idx % hidden_size;
-
-    int token_id = tokens[s];
-    output[idx] = embed_table[token_id * hidden_size + d];
+        B[idx] = bcx[bcx_idx_B];
+        C[idx] = bcx[bcx_idx_C];
+        x_gate[idx] = bcx[bcx_idx_x];
+    }
 }
 
-// ============================================================================
-// OPTIMIZATION 2.2: Persistent GPU Buffer Manager
-// ============================================================================
-
-class PersistentGPUBuffers {
-public:
-    // Singleton instance
-    static PersistentGPUBuffers& instance() {
-        static PersistentGPUBuffers inst;
-        return inst;
+// Copy last token kernel
+__global__ void copy_last_token_kernel(const float* input, float* output,
+                                        size_t seq_len, size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < hidden_size) {
+        output[idx] = input[(seq_len - 1) * hidden_size + idx];
     }
+}
 
-    // Pre-allocated buffers for different operations
-    float* shortconv_workspace = nullptr;
-    size_t shortconv_workspace_size = 0;
+// MoE routing kernels
+__global__ void compute_routing_weights_kernel(const float* router_logits, float* routing_weights,
+                                                size_t num_tokens, size_t num_experts) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_tokens * num_experts) {
+        float logit = router_logits[idx];
+        float inv_denom = 1.0f / (1.0f + expf(-logit));
+        routing_weights[idx] = 1.0f * inv_denom;
+    }
+}
 
-    float* attention_workspace = nullptr;
-    size_t attention_workspace_size = 0;
+// Top-k selection kernel
+__global__ void topk_routing_kernel(const float* routing_weights, const float* expert_bias,
+                                     int* top_k_indices, float* top_k_weights,
+                                     size_t num_tokens, size_t num_experts, size_t k,
+                                     bool use_bias, bool norm_prob, float scaling_factor) {
+    extern __shared__ float shared[];
+    float* scores = shared;
+    int* indices = (int*)(shared + num_experts);
 
-    float* embedding_d_tokens = nullptr;
-    float* embedding_d_table = nullptr;
-    float* embedding_d_output = nullptr;
-    size_t embedding_table_size = 0;
-    size_t embedding_max_seq = 0;
+    size_t t = blockIdx.x;
+    if (t >= num_tokens) return;
 
-    bool initialized = false;
-
-    void init(size_t max_batch, size_t max_seq_len, size_t hidden_size,
-              size_t vocab_size, size_t num_heads, size_t head_dim) {
-        if (initialized) return;
-
-        // ShortConv workspace: B, C, x_gate, conv_out (each batch*hidden*seq)
-        // Plus in_proj_out (batch*seq*3*hidden) and y_pre (batch*seq*hidden)
-        size_t shortconv_size = max_batch * max_seq_len * hidden_size * 4 +  // B, C, x_gate, conv_out
-                                max_batch * max_seq_len * 3 * hidden_size +   // in_proj_out
-                                max_batch * max_seq_len * hidden_size;        // y_pre
-
-        if (shortconv_size > shortconv_workspace_size) {
-            if (shortconv_workspace) cudaFree(shortconv_workspace);
-            cudaMalloc(&shortconv_workspace, shortconv_size * sizeof(float));
-            shortconv_workspace_size = shortconv_size;
+    for (size_t e = threadIdx.x; e < num_experts; e += blockDim.x) {
+        float weight = routing_weights[t * num_experts + e];
+        float score = weight;
+        if (use_bias && expert_bias != nullptr) {
+            score += expert_bias[e];
         }
-
-        // Attention workspace: Q, K, V, scores, output
-        size_t attn_qkv_size = max_batch * num_heads * max_seq_len * head_dim;
-        size_t attn_scores_size = max_batch * num_heads * max_seq_len * max_seq_len;
-        size_t attn_size = attn_qkv_size * 3 + attn_scores_size + attn_qkv_size;
-
-        if (attn_size > attention_workspace_size) {
-            if (attention_workspace) cudaFree(attention_workspace);
-            cudaMalloc(&attention_workspace, attn_size * sizeof(float));
-            attention_workspace_size = attn_size;
-        }
-
-        // Embedding buffers
-        if (vocab_size * hidden_size > embedding_table_size) {
-            if (embedding_d_table) cudaFree(embedding_d_table);
-            cudaMalloc(&embedding_d_table, vocab_size * hidden_size * sizeof(float));
-            embedding_table_size = vocab_size * hidden_size;
-        }
-
-        if (max_seq_len > embedding_max_seq) {
-            if (embedding_d_tokens) cudaFree(embedding_d_tokens);
-            if (embedding_d_output) cudaFree(embedding_d_output);
-            cudaMalloc(&embedding_d_tokens, max_seq_len * sizeof(int));
-            cudaMalloc(&embedding_d_output, max_batch * max_seq_len * hidden_size * sizeof(float));
-            embedding_max_seq = max_seq_len;
-        }
-
-        initialized = true;
+        scores[e] = score;
+        indices[e] = e;
     }
+    __syncthreads();
 
-    ~PersistentGPUBuffers() {
-        if (shortconv_workspace) cudaFree(shortconv_workspace);
-        if (attention_workspace) cudaFree(attention_workspace);
-        if (embedding_d_tokens) cudaFree(embedding_d_tokens);
-        if (embedding_d_table) cudaFree(embedding_d_table);
-        if (embedding_d_output) cudaFree(embedding_d_output);
-    }
-
-private:
-    PersistentGPUBuffers() = default;
-    PersistentGPUBuffers(const PersistentGPUBuffers&) = delete;
-    PersistentGPUBuffers& operator=(const PersistentGPUBuffers&) = delete;
-};
-
-// Global flag for embedding table upload
-// Note: g_embedding_uploaded removed - now handled by PersistentGPUWeights
-
-// ============================================================================
-// OPTIMIZATION 3.3: CUDA Stream Manager for Async Memory Transfers
-// ============================================================================
-
-class CUDAStreamManager {
-public:
-    static CUDAStreamManager& instance() {
-        static CUDAStreamManager inst;
-        return inst;
-    }
-
-    // Streams for different operations
-    cudaStream_t compute_stream;
-    cudaStream_t h2d_stream;  // Host to Device
-    cudaStream_t d2h_stream;  // Device to Host
-
-    bool initialized = false;
-
-    void init() {
-        if (initialized) return;
-
-        cudaStreamCreate(&compute_stream);
-        cudaStreamCreate(&h2d_stream);
-        cudaStreamCreate(&d2h_stream);
-
-        initialized = true;
-    }
-
-    ~CUDAStreamManager() {
-        if (initialized) {
-            cudaStreamDestroy(compute_stream);
-            cudaStreamDestroy(h2d_stream);
-            cudaStreamDestroy(d2h_stream);
-        }
-    }
-
-    // Async H2D transfer
-    void async_h2d(void* dst, const void* src, size_t size) {
-        cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, h2d_stream);
-    }
-
-    // Async D2H transfer
-    void async_d2h(void* dst, const void* src, size_t size) {
-        cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, d2h_stream);
-    }
-
-    // Wait for H2D transfers to complete
-    void sync_h2d() {
-        cudaStreamSynchronize(h2d_stream);
-    }
-
-    // Wait for D2H transfers to complete
-    void sync_d2h() {
-        cudaStreamSynchronize(d2h_stream);
-    }
-
-    // Wait for compute to complete
-    void sync_compute() {
-        cudaStreamSynchronize(compute_stream);
-    }
-
-    // Wait for all streams
-    void sync_all() {
-        cudaStreamSynchronize(h2d_stream);
-        cudaStreamSynchronize(d2h_stream);
-        cudaStreamSynchronize(compute_stream);
-    }
-
-private:
-    CUDAStreamManager() = default;
-    CUDAStreamManager(const CUDAStreamManager&) = delete;
-    CUDAStreamManager& operator=(const CUDAStreamManager&) = delete;
-};
-
-// Pinned memory allocator for faster H2D/D2H transfers
-class PinnedMemoryPool {
-public:
-    static PinnedMemoryPool& instance() {
-        static PinnedMemoryPool inst;
-        return inst;
-    }
-
-    // Allocate pinned memory
-    void* allocate(size_t size) {
-        void* ptr;
-        cudaMallocHost(&ptr, size);
-        allocations_.push_back(ptr);
-        return ptr;
-    }
-
-    // Free all allocations (call at program end)
-    void free_all() {
-        for (void* ptr : allocations_) {
-            cudaFreeHost(ptr);
-        }
-        allocations_.clear();
-    }
-
-    ~PinnedMemoryPool() {
-        free_all();
-    }
-
-private:
-    std::vector<void*> allocations_;
-    PinnedMemoryPool() = default;
-    PinnedMemoryPool(const PinnedMemoryPool&) = delete;
-    PinnedMemoryPool& operator=(const PinnedMemoryPool&) = delete;
-};
-
-// ============================================================================
-// GPU Tensor Class for persistent GPU storage
-// ============================================================================
-
-class GPUTensor {
-public:
-    float* data_;
-    std::vector<size_t> shape_;
-    size_t size_;
-    int device_id_;
-    bool owns_data_;
-
-    GPUTensor() : data_(nullptr), size_(0), device_id_(0), owns_data_(false) {}
-
-    GPUTensor(const std::vector<size_t>& shape, int device_id = 0)
-        : shape_(shape), device_id_(device_id), owns_data_(true) {
-        size_ = 1;
-        for (auto s : shape_) size_ *= s;
-
-        cudaSetDevice(device_id_);
-        cudaMalloc(&data_, size_ * sizeof(float));
-    }
-
-    ~GPUTensor() {
-        if (owns_data_ && data_) {
-            cudaSetDevice(device_id_);
-            cudaFree(data_);
-        }
-    }
-
-    // Move constructor
-    GPUTensor(GPUTensor&& other) noexcept
-        : data_(other.data_), shape_(std::move(other.shape_)),
-          size_(other.size_), device_id_(other.device_id_), owns_data_(other.owns_data_) {
-        other.data_ = nullptr;
-        other.owns_data_ = false;
-    }
-
-    GPUTensor& operator=(GPUTensor&& other) noexcept {
-        if (this != &other) {
-            if (owns_data_ && data_) {
-                cudaSetDevice(device_id_);
-                cudaFree(data_);
+    if (threadIdx.x == 0) {
+        for (size_t i = 0; i < k; i++) {
+            size_t max_idx = i;
+            for (size_t j = i + 1; j < num_experts; j++) {
+                if (scores[j] > scores[max_idx]) {
+                    max_idx = j;
+                }
             }
-            data_ = other.data_;
-            shape_ = std::move(other.shape_);
-            size_ = other.size_;
-            device_id_ = other.device_id_;
-            owns_data_ = other.owns_data_;
-            other.data_ = nullptr;
-            other.owns_data_ = false;
+            float tmp_score = scores[i];
+            scores[i] = scores[max_idx];
+            scores[max_idx] = tmp_score;
+            int tmp_idx = indices[i];
+            indices[i] = indices[max_idx];
+            indices[max_idx] = tmp_idx;
         }
-        return *this;
-    }
 
-    void upload(const Tensor& cpu_tensor) {
-        cudaSetDevice(device_id_);
-        cudaMemcpy(data_, cpu_tensor.data(), size_ * sizeof(float), cudaMemcpyHostToDevice);
-    }
+        float selected_weights[8];
+        float sum = 0.0f;
+        for (size_t i = 0; i < k; i++) {
+            int expert_idx = indices[i];
+            selected_weights[i] = routing_weights[t * num_experts + expert_idx];
+            sum += selected_weights[i];
+        }
 
-    void download(Tensor& cpu_tensor) const {
-        cudaSetDevice(device_id_);
-        cudaMemcpy(cpu_tensor.data(), data_, size_ * sizeof(float), cudaMemcpyDeviceToHost);
+        float inv_sum = (norm_prob && sum > 1e-6f) ? (1.0f / sum) : 1.0f;
+        for (size_t i = 0; i < k; i++) {
+            top_k_indices[t * k + i] = indices[i];
+            float weight = selected_weights[i];
+            if (norm_prob && sum > 1e-6f) {
+                weight *= inv_sum;
+            }
+            top_k_weights[t * k + i] = weight * scaling_factor;
+        }
     }
+}
 
-    size_t size(int dim) const {
-        if (dim < 0) dim += shape_.size();
-        return shape_[dim];
+// Expert output accumulation kernel
+__global__ void accumulate_expert_output_kernel(float* y, const float* expert_out, float weight,
+                                                 size_t offset, size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < hidden_size) {
+        atomicAdd(&y[offset + idx], weight * expert_out[idx]);
     }
-};
+}
+
+// Copy token input kernel
+__global__ void copy_token_input_kernel(const float* x_flat, float* token_in,
+                                         size_t token_idx, size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < hidden_size) {
+        token_in[idx] = x_flat[token_idx * hidden_size + idx];
+    }
+}
 
 // ============================================================================
-// GPU-accelerated Layer Implementations
+// MLP Implementation
 // ============================================================================
 
-// GPU MLP implementation
-class GPUMLP {
-public:
-    GPUTensor w1_, w2_, w3_;
-    int device_id_;
-
-    GPUMLP(const std::string& w1_file, const std::string& w2_file,
-           const std::string& w3_file, int device_id = 0) : device_id_(device_id) {
-        Tensor w1_cpu = Tensor::load_from_file(w1_file);
-        Tensor w2_cpu = Tensor::load_from_file(w2_file);
-        Tensor w3_cpu = Tensor::load_from_file(w3_file);
-
-        w1_ = GPUTensor(w1_cpu.shape(), device_id_);
-        w2_ = GPUTensor(w2_cpu.shape(), device_id_);
-        w3_ = GPUTensor(w3_cpu.shape(), device_id_);
-
-        w1_.upload(w1_cpu);
-        w2_.upload(w2_cpu);
-        w3_.upload(w3_cpu);
-    }
-
-    void forward(float* d_input, float* d_output, float* workspace,
-                 size_t batch_seq, size_t hidden_size, cudaStream_t stream) {
-        size_t intermediate_size = w1_.size(0);
-
-        // Workspace layout:
-        // gate: batch_seq * intermediate_size
-        // gate_silu: batch_seq * intermediate_size
-        // up: batch_seq * intermediate_size
-        // hidden: batch_seq * intermediate_size
-
-        float* d_gate = workspace;
-        float* d_gate_silu = workspace + batch_seq * intermediate_size;
-        float* d_up = d_gate_silu + batch_seq * intermediate_size;
-        float* d_hidden = d_up + batch_seq * intermediate_size;
-
-        // gate = input @ w1^T
-        dim3 block(TILE_SIZE, TILE_SIZE);
-        dim3 grid_gate((intermediate_size + TILE_SIZE - 1) / TILE_SIZE,
-                       (batch_seq + TILE_SIZE - 1) / TILE_SIZE);
-        matmul_kernel<<<grid_gate, block, 0, stream>>>(
-            d_input, w1_.data_, d_gate, batch_seq, intermediate_size, hidden_size);
-
-        // gate_silu = silu(gate)
-        int silu_blocks = (batch_seq * intermediate_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        silu_kernel<<<silu_blocks, BLOCK_SIZE, 0, stream>>>(
-            d_gate, d_gate_silu, batch_seq * intermediate_size);
-
-        // up = input @ w3^T
-        matmul_kernel<<<grid_gate, block, 0, stream>>>(
-            d_input, w3_.data_, d_up, batch_seq, intermediate_size, hidden_size);
-
-        // hidden = gate_silu * up
-        mul_kernel<<<silu_blocks, BLOCK_SIZE, 0, stream>>>(
-            d_gate_silu, d_up, d_hidden, batch_seq * intermediate_size);
-
-        // output = hidden @ w2^T
-        dim3 grid_out((hidden_size + TILE_SIZE - 1) / TILE_SIZE,
-                      (batch_seq + TILE_SIZE - 1) / TILE_SIZE);
-        matmul_kernel<<<grid_out, block, 0, stream>>>(
-            d_hidden, w2_.data_, d_output, batch_seq, hidden_size, intermediate_size);
-    }
-};
-
-// ============================================================================
-// Large Block Implementations - Complex layers and modules
-// ============================================================================
-
-// MLP (Feed-Forward Network) implementation - allocate per-call for correctness
 MLP::MLP(const std::string& w1_file, const std::string& w2_file, const std::string& w3_file) {
     w1_ = Tensor::load_from_file(w1_file);
     w2_ = Tensor::load_from_file(w2_file);
     w3_ = Tensor::load_from_file(w3_file);
-    // GPU pointers not used - set to nullptr
-    d_w1_ = nullptr;
-    d_w2_ = nullptr;
-    d_w3_ = nullptr;
-}
-
-MLP::~MLP() {
-    // No GPU memory to free in per-call mode
-}
-
-// Move constructor
-MLP::MLP(MLP&& other) noexcept
-    : w1_(std::move(other.w1_)), w3_(std::move(other.w3_)), w2_(std::move(other.w2_)),
-      d_w1_(nullptr), d_w2_(nullptr), d_w3_(nullptr) {
-}
-
-// Move assignment operator
-MLP& MLP::operator=(MLP&& other) noexcept {
-    if (this != &other) {
-        w1_ = std::move(other.w1_);
-        w2_ = std::move(other.w2_);
-        w3_ = std::move(other.w3_);
-    }
-    return *this;
 }
 
 void MLP::forward(const Tensor& x, Tensor& y) {
@@ -938,81 +432,55 @@ void MLP::forward(const Tensor& x, Tensor& y) {
     size_t seq_len = x.size(1);
     size_t hidden_size = x.size(2);
     size_t intermediate_size = w1_.size(0);
-    size_t batch_seq = batch * seq_len;
 
-    // Allocate GPU memory
-    float *d_input, *d_w1, *d_w2, *d_w3, *d_output;
-    float *d_gate, *d_gate_silu, *d_up, *d_hidden;
+    Tensor x_flat = x.view({batch * seq_len, hidden_size});
 
-    cudaMalloc(&d_input, batch_seq * hidden_size * sizeof(float));
-    cudaMalloc(&d_w1, intermediate_size * hidden_size * sizeof(float));
-    cudaMalloc(&d_w2, hidden_size * intermediate_size * sizeof(float));
-    cudaMalloc(&d_w3, intermediate_size * hidden_size * sizeof(float));
-    cudaMalloc(&d_output, batch_seq * hidden_size * sizeof(float));
-    cudaMalloc(&d_gate, batch_seq * intermediate_size * sizeof(float));
-    cudaMalloc(&d_gate_silu, batch_seq * intermediate_size * sizeof(float));
-    cudaMalloc(&d_up, batch_seq * intermediate_size * sizeof(float));
-    cudaMalloc(&d_hidden, batch_seq * intermediate_size * sizeof(float));
+    Tensor gate({batch * seq_len, intermediate_size});
+    tensor_ops::matmul_transposed(x_flat, w1_, gate);
+    Tensor gate_silu({batch * seq_len, intermediate_size});
+    tensor_ops::silu(gate, gate_silu);
 
-    // Upload data
-    cudaMemcpy(d_input, x.data(), batch_seq * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_w1, w1_.data(), intermediate_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_w2, w2_.data(), hidden_size * intermediate_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_w3, w3_.data(), intermediate_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
+    Tensor up({batch * seq_len, intermediate_size});
+    tensor_ops::matmul_transposed(x_flat, w3_, up);
 
-    // gate = input @ w1^T
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid_gate((intermediate_size + TILE_SIZE - 1) / TILE_SIZE,
-                   (batch_seq + TILE_SIZE - 1) / TILE_SIZE);
-    matmul_kernel<<<grid_gate, block>>>(d_input, d_w1, d_gate, batch_seq, intermediate_size, hidden_size);
+    Tensor hidden({batch * seq_len, intermediate_size});
+    tensor_ops::mul(gate_silu, up, hidden);
 
-    // gate_silu = silu(gate)
-    int silu_blocks = (batch_seq * intermediate_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    silu_kernel<<<silu_blocks, BLOCK_SIZE>>>(d_gate, d_gate_silu, batch_seq * intermediate_size);
+    Tensor y_flat({batch * seq_len, hidden_size});
+    tensor_ops::matmul_transposed(hidden, w2_, y_flat);
 
-    // up = input @ w3^T
-    matmul_kernel<<<grid_gate, block>>>(d_input, d_w3, d_up, batch_seq, intermediate_size, hidden_size);
+    y_flat.reshape({batch, seq_len, hidden_size});
 
-    // hidden = gate_silu * up
-    mul_kernel<<<silu_blocks, BLOCK_SIZE>>>(d_gate_silu, d_up, d_hidden, batch_seq * intermediate_size);
-
-    // output = hidden @ w2^T
-    dim3 grid_out((hidden_size + TILE_SIZE - 1) / TILE_SIZE,
-                  (batch_seq + TILE_SIZE - 1) / TILE_SIZE);
-    matmul_kernel<<<grid_out, block>>>(d_hidden, d_w2, d_output, batch_seq, hidden_size, intermediate_size);
-
-    // Download result
     if (y.size() == 0) {
         y = Tensor({batch, seq_len, hidden_size});
     }
-    cudaMemcpy(y.data(), d_output, batch_seq * hidden_size * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Free GPU memory
-    cudaFree(d_input);
-    cudaFree(d_w1);
-    cudaFree(d_w2);
-    cudaFree(d_w3);
-    cudaFree(d_output);
-    cudaFree(d_gate);
-    cudaFree(d_gate_silu);
-    cudaFree(d_up);
-    cudaFree(d_hidden);
+    CHECK_CUDA(cudaMemcpy(y.data(), y_flat.data(), y.size() * sizeof(float), cudaMemcpyDeviceToDevice));
 }
 
-// SparseMoeBlock implementation
-SparseMoeBlock::SparseMoeBlock(int layer_idx) {
+// ============================================================================
+// SparseMoeBlock Implementation with Expert Parallelism
+// ============================================================================
+
+SparseMoeBlock::SparseMoeBlock(int layer_idx) : layer_idx_(layer_idx) {
     std::stringstream ss;
     ss << "layers." << layer_idx << ".feed_forward.gate.weight";
     gate_ = Tensor::load_from_file(ss.str());
 
-    experts_.reserve(NUM_EXPERTS);
-    for (size_t i = 0; i < NUM_EXPERTS; i++) {
-        std::stringstream ss_w1, ss_w2, ss_w3;
-        ss_w1 << "layers." << layer_idx << ".feed_forward.experts." << i << ".w1.weight";
-        ss_w2 << "layers." << layer_idx << ".feed_forward.experts." << i << ".w2.weight";
-        ss_w3 << "layers." << layer_idx << ".feed_forward.experts." << i << ".w3.weight";
+    // Only load experts assigned to this GPU
+    int expert_start = g_parallel_ctx.expert_start;
+    int expert_end = g_parallel_ctx.expert_end;
 
-        experts_.emplace_back(ss_w1.str(), ss_w2.str(), ss_w3.str());
+    local_experts_.reserve(NUM_EXPERTS_PER_GPU);
+    local_to_global_expert_.reserve(NUM_EXPERTS_PER_GPU);
+
+    for (int e = expert_start; e < expert_end; e++) {
+        std::stringstream ss_w1, ss_w2, ss_w3;
+        ss_w1 << "layers." << layer_idx << ".feed_forward.experts." << e << ".w1.weight";
+        ss_w2 << "layers." << layer_idx << ".feed_forward.experts." << e << ".w2.weight";
+        ss_w3 << "layers." << layer_idx << ".feed_forward.experts." << e << ".w3.weight";
+
+        local_experts_.emplace_back(ss_w1.str(), ss_w2.str(), ss_w3.str());
+        local_to_global_expert_.push_back(e);
     }
 
     if (USE_EXPERT_BIAS) {
@@ -1030,51 +498,34 @@ void SparseMoeBlock::route_tokens(const Tensor& router_logits,
     top_k_indices.resize(num_tokens * NUM_EXPERTS_PER_TOK);
     top_k_weights.resize(num_tokens * NUM_EXPERTS_PER_TOK);
 
-    #pragma omp parallel for
-    for (size_t t = 0; t < num_tokens; t++) {
-        std::vector<float> routing_weights(NUM_EXPERTS);
-        for (size_t e = 0; e < NUM_EXPERTS; e++) {
-            float logit = router_logits.at(t, e);
-            routing_weights[e] = 1.0f * (1.0f / (1.0f + std::exp(-logit)));
-        }
+    Tensor routing_weights({num_tokens, NUM_EXPERTS});
 
-        std::vector<std::pair<float, int>> scores(NUM_EXPERTS);
-        if (USE_EXPERT_BIAS) {
-            for (size_t e = 0; e < NUM_EXPERTS; e++) {
-                scores[e] = {routing_weights[e] + expert_bias_[e], e};
-            }
-        } else {
-            for (size_t e = 0; e < NUM_EXPERTS; e++) {
-                scores[e] = {routing_weights[e], e};
-            }
-        }
+    int blocks = (num_tokens * NUM_EXPERTS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    compute_routing_weights_kernel<<<blocks, BLOCK_SIZE>>>(
+        router_logits.data(), routing_weights.data(), num_tokens, NUM_EXPERTS);
+    CHECK_CUDA(cudaGetLastError());
 
-        std::partial_sort(scores.begin(), scores.begin() + NUM_EXPERTS_PER_TOK, scores.end(),
-                         [](const auto& a, const auto& b) { return a.first > b.first; });
+    int* d_top_k_indices;
+    float* d_top_k_weights;
+    CHECK_CUDA(cudaMalloc(&d_top_k_indices, num_tokens * NUM_EXPERTS_PER_TOK * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_top_k_weights, num_tokens * NUM_EXPERTS_PER_TOK * sizeof(float)));
 
-        std::vector<float> selected_weights(NUM_EXPERTS_PER_TOK);
-        for (size_t k = 0; k < NUM_EXPERTS_PER_TOK; k++) {
-            int expert_idx = scores[k].second;
-            top_k_indices[t * NUM_EXPERTS_PER_TOK + k] = expert_idx;
-            selected_weights[k] = routing_weights[expert_idx];
-        }
+    size_t shared_mem = NUM_EXPERTS * sizeof(float) + NUM_EXPERTS * sizeof(int);
+    topk_routing_kernel<<<num_tokens, 32, shared_mem>>>(
+        routing_weights.data(),
+        USE_EXPERT_BIAS ? expert_bias_.data() : nullptr,
+        d_top_k_indices, d_top_k_weights,
+        num_tokens, NUM_EXPERTS, NUM_EXPERTS_PER_TOK,
+        USE_EXPERT_BIAS, NORM_TOPK_PROB, ROUTED_SCALING_FACTOR);
+    CHECK_CUDA(cudaGetLastError());
 
-        if (NORM_TOPK_PROB) {
-            float sum = 0.0f;
-            for (size_t k = 0; k < NUM_EXPERTS_PER_TOK; k++) {
-                sum += selected_weights[k];
-            }
-            if (sum > 1e-6f) {
-                for (size_t k = 0; k < NUM_EXPERTS_PER_TOK; k++) {
-                    selected_weights[k] /= sum;
-                }
-            }
-        }
+    CHECK_CUDA(cudaMemcpy(top_k_indices.data(), d_top_k_indices,
+                          num_tokens * NUM_EXPERTS_PER_TOK * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(top_k_weights.data(), d_top_k_weights,
+                          num_tokens * NUM_EXPERTS_PER_TOK * sizeof(float), cudaMemcpyDeviceToHost));
 
-        for (size_t k = 0; k < NUM_EXPERTS_PER_TOK; k++) {
-            top_k_weights[t * NUM_EXPERTS_PER_TOK + k] = selected_weights[k] * ROUTED_SCALING_FACTOR;
-        }
-    }
+    CHECK_CUDA(cudaFree(d_top_k_indices));
+    CHECK_CUDA(cudaFree(d_top_k_weights));
 }
 
 void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) {
@@ -1082,149 +533,97 @@ void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) 
     size_t seq_len = x.size(1);
     size_t hidden_size = x.size(2);
     size_t num_tokens = batch * seq_len;
-    size_t intermediate_size = MOE_INTERMEDIATE_SIZE;
 
     Tensor x_flat = x.view({num_tokens, hidden_size});
 
+    // Compute router logits (all GPUs compute this)
     router_logits = Tensor({num_tokens, NUM_EXPERTS});
     tensor_ops::matmul_transposed(x_flat, gate_, router_logits);
 
+    // Route tokens
     std::vector<int> top_k_indices;
     std::vector<float> top_k_weights;
     route_tokens(router_logits, top_k_indices, top_k_weights);
 
+    // Initialize output
     y = Tensor({batch, seq_len, hidden_size});
     y.zero();
 
-    // =========================================================================
-    // OPTIMIZATION 1.1: Batched Multi-GPU Expert Processing
-    // =========================================================================
-
-    // Build token-to-expert assignment matrix for batch processing
-    // expert_tokens[e] = list of (token_idx, weight) pairs for expert e
-    std::vector<std::vector<std::pair<size_t, float>>> expert_tokens(NUM_EXPERTS);
+    // Prepare buffers for expert parallelism
+    // Count tokens per expert for this GPU's local experts
+    std::vector<std::vector<int>> tokens_for_expert(NUM_EXPERTS_PER_GPU);
+    std::vector<std::vector<float>> weights_for_expert(NUM_EXPERTS_PER_GPU);
 
     for (size_t t = 0; t < num_tokens; t++) {
         for (size_t k = 0; k < NUM_EXPERTS_PER_TOK; k++) {
             int expert_idx = top_k_indices[t * NUM_EXPERTS_PER_TOK + k];
             float weight = top_k_weights[t * NUM_EXPERTS_PER_TOK + k];
-            expert_tokens[expert_idx].push_back({t, weight});
-        }
-    }
 
-    // Get number of available GPUs
-    int device_count = 1;
-    cudaGetDeviceCount(&device_count);
-    int num_gpus = std::min(device_count, (int)NUM_GPUS);
-
-    // Allocate output accumulator on CPU (thread-safe accumulation)
-    std::vector<float> y_accum(num_tokens * hidden_size, 0.0f);
-
-    // Process experts in parallel across multiple GPUs
-    // Each GPU processes a subset of experts concurrently
-    #pragma omp parallel for schedule(dynamic)
-    for (size_t e = 0; e < NUM_EXPERTS; e++) {
-        if (expert_tokens[e].empty()) continue;
-
-        // Assign expert to GPU based on expert index (round-robin)
-        int gpu_id = e % num_gpus;
-        cudaSetDevice(gpu_id);
-
-        size_t batch_size = expert_tokens[e].size();
-
-        // Allocate GPU memory for this expert batch
-        float *d_input, *d_output;
-        float *d_w1, *d_w2, *d_w3;
-        float *d_gate, *d_gate_silu, *d_up, *d_hidden;
-
-        cudaMalloc(&d_input, batch_size * hidden_size * sizeof(float));
-        cudaMalloc(&d_output, batch_size * hidden_size * sizeof(float));
-        cudaMalloc(&d_w1, intermediate_size * hidden_size * sizeof(float));
-        cudaMalloc(&d_w2, hidden_size * intermediate_size * sizeof(float));
-        cudaMalloc(&d_w3, intermediate_size * hidden_size * sizeof(float));
-        cudaMalloc(&d_gate, batch_size * intermediate_size * sizeof(float));
-        cudaMalloc(&d_gate_silu, batch_size * intermediate_size * sizeof(float));
-        cudaMalloc(&d_up, batch_size * intermediate_size * sizeof(float));
-        cudaMalloc(&d_hidden, batch_size * intermediate_size * sizeof(float));
-
-        // Create batched input tensor on CPU
-        std::vector<float> batch_in_data(batch_size * hidden_size);
-        for (size_t i = 0; i < batch_size; i++) {
-            size_t t = expert_tokens[e][i].first;
-            for (size_t h = 0; h < hidden_size; h++) {
-                batch_in_data[i * hidden_size + h] = x_flat.at(t, h);
-            }
-        }
-
-        // Upload input and weights to GPU
-        cudaMemcpy(d_input, batch_in_data.data(), batch_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_w1, experts_[e].w1().data(), intermediate_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_w2, experts_[e].w2().data(), hidden_size * intermediate_size * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_w3, experts_[e].w3().data(), intermediate_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-
-        // Run MLP forward pass on GPU
-        // gate = input @ w1^T
-        dim3 block(TILE_SIZE, TILE_SIZE);
-        dim3 grid_gate((intermediate_size + TILE_SIZE - 1) / TILE_SIZE,
-                       (batch_size + TILE_SIZE - 1) / TILE_SIZE);
-        matmul_kernel<<<grid_gate, block>>>(d_input, d_w1, d_gate, batch_size, intermediate_size, hidden_size);
-
-        // gate_silu = silu(gate)
-        int silu_blocks = (batch_size * intermediate_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        silu_kernel<<<silu_blocks, BLOCK_SIZE>>>(d_gate, d_gate_silu, batch_size * intermediate_size);
-
-        // up = input @ w3^T
-        matmul_kernel<<<grid_gate, block>>>(d_input, d_w3, d_up, batch_size, intermediate_size, hidden_size);
-
-        // hidden = gate_silu * up
-        mul_kernel<<<silu_blocks, BLOCK_SIZE>>>(d_gate_silu, d_up, d_hidden, batch_size * intermediate_size);
-
-        // output = hidden @ w2^T
-        dim3 grid_out((hidden_size + TILE_SIZE - 1) / TILE_SIZE,
-                      (batch_size + TILE_SIZE - 1) / TILE_SIZE);
-        matmul_kernel<<<grid_out, block>>>(d_hidden, d_w2, d_output, batch_size, hidden_size, intermediate_size);
-
-        // Download result
-        std::vector<float> batch_out_data(batch_size * hidden_size);
-        cudaMemcpy(batch_out_data.data(), d_output, batch_size * hidden_size * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // Free GPU memory
-        cudaFree(d_input);
-        cudaFree(d_output);
-        cudaFree(d_w1);
-        cudaFree(d_w2);
-        cudaFree(d_w3);
-        cudaFree(d_gate);
-        cudaFree(d_gate_silu);
-        cudaFree(d_up);
-        cudaFree(d_hidden);
-
-        // Accumulate weighted outputs (thread-safe with atomic or critical section)
-        for (size_t i = 0; i < batch_size; i++) {
-            size_t t = expert_tokens[e][i].first;
-            float weight = expert_tokens[e][i].second;
-
-            for (size_t h = 0; h < hidden_size; h++) {
-                #pragma omp atomic
-                y_accum[t * hidden_size + h] += weight * batch_out_data[i * hidden_size + h];
+            // Check if this expert is local to this GPU
+            if (g_parallel_ctx.is_expert_local(expert_idx)) {
+                int local_idx = expert_idx - g_parallel_ctx.expert_start;
+                tokens_for_expert[local_idx].push_back(t);
+                weights_for_expert[local_idx].push_back(weight);
             }
         }
     }
 
-    // Copy accumulated results to output tensor
-    for (size_t t = 0; t < num_tokens; t++) {
-        size_t b = t / seq_len;
-        size_t s = t % seq_len;
-        for (size_t h = 0; h < hidden_size; h++) {
-            y.at(b, s, h) = y_accum[t * hidden_size + h];
+    // Allocate temporary buffers for batched processing
+    Tensor token_in({1, 1, hidden_size});
+    Tensor expert_out({1, 1, hidden_size});
+
+    // Process local experts on compute stream
+    cudaStream_t compute_stream = g_parallel_ctx.compute_stream;
+    for (size_t local_e = 0; local_e < NUM_EXPERTS_PER_GPU; local_e++) {
+        if (tokens_for_expert[local_e].empty()) continue;
+
+        for (size_t i = 0; i < tokens_for_expert[local_e].size(); i++) {
+            int t = tokens_for_expert[local_e][i];
+            float weight = weights_for_expert[local_e][i];
+
+            // Copy token input on compute stream
+            int token_blocks = (hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            copy_token_input_kernel<<<token_blocks, BLOCK_SIZE, 0, compute_stream>>>(
+                x_flat.data(), token_in.data(), t, hidden_size);
+
+            // Process through expert (uses default stream, sync with compute)
+            CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+            local_experts_[local_e].forward(token_in, expert_out);
+
+            // Accumulate weighted output on compute stream
+            accumulate_expert_output_kernel<<<token_blocks, BLOCK_SIZE, 0, compute_stream>>>(
+                y.data(), expert_out.data(), weight, t * hidden_size, hidden_size);
         }
     }
+    CHECK_CUDA(cudaGetLastError());
 
-    // Reset to default GPU
-    cudaSetDevice(0);
+    // Wait for compute to finish before D2H transfer
+    CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+
+    // Synchronize and reduce across GPUs within the node
+    // Use async D2H transfer
+    y.sync_to_host_async(g_parallel_ctx.d2h_stream);
+
+    // Wait for D2H transfer to complete before MPI
+    CHECK_CUDA(cudaStreamSynchronize(g_parallel_ctx.d2h_stream));
+    y.mark_host_valid();
+    float* y_host = y.host_data();
+
+    // MPI_Allreduce within node to combine expert outputs
+    MPI_Allreduce(MPI_IN_PLACE, y_host, num_tokens * hidden_size,
+                  MPI_FLOAT, MPI_SUM, g_parallel_ctx.node_comm);
+
+    // Async copy back to device
+    CHECK_CUDA(cudaMemcpyAsync(y.data(), y_host, num_tokens * hidden_size * sizeof(float),
+                               cudaMemcpyHostToDevice, g_parallel_ctx.h2d_stream));
+    CHECK_CUDA(cudaStreamSynchronize(g_parallel_ctx.h2d_stream));
+    y.mark_device_valid();
 }
 
-// Attention implementation
+// ============================================================================
+// Attention Implementation
+// ============================================================================
+
 Attention::Attention(int layer_idx) : layer_idx_(layer_idx) {
     std::stringstream ss_q, ss_k, ss_v, ss_o, ss_q_ln, ss_k_ln;
     ss_q << "layers." << layer_idx << ".self_attn.q_proj.weight";
@@ -1245,15 +644,12 @@ Attention::Attention(int layer_idx) : layer_idx_(layer_idx) {
 
 void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
                        const Tensor* attention_mask, Tensor& output) {
-    // x: (batch, seq_len, hidden_size)
     size_t batch = x.size(0);
     size_t seq_len = x.size(1);
     size_t hidden_size = x.size(2);
 
-    // Flatten
     Tensor x_flat = x.view({batch * seq_len, hidden_size});
 
-    // Project Q, K, V (using GPU-accelerated matmul from tensor_ops)
     Tensor q_proj_out({batch * seq_len, NUM_ATTENTION_HEADS * HEAD_DIM});
     Tensor k_proj_out({batch * seq_len, NUM_KEY_VALUE_HEADS * HEAD_DIM});
     Tensor v_proj_out({batch * seq_len, NUM_KEY_VALUE_HEADS * HEAD_DIM});
@@ -1262,196 +658,94 @@ void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
     tensor_ops::matmul_transposed(x_flat, k_proj_, k_proj_out);
     tensor_ops::matmul_transposed(x_flat, v_proj_, v_proj_out);
 
-    // Reshape to (batch, seq_len, num_heads, head_dim) for layernorm
     Tensor q_reshaped({batch, seq_len, NUM_ATTENTION_HEADS, HEAD_DIM});
     Tensor k_reshaped({batch, seq_len, NUM_KEY_VALUE_HEADS, HEAD_DIM});
     Tensor v_reshaped({batch, seq_len, NUM_KEY_VALUE_HEADS, HEAD_DIM});
 
-    for (size_t b = 0; b < batch; b++) {
-        for (size_t s = 0; s < seq_len; s++) {
-            for (size_t h = 0; h < NUM_ATTENTION_HEADS; h++) {
-                for (size_t d = 0; d < HEAD_DIM; d++) {
-                    q_reshaped.at(b, s, h, d) = q_proj_out.at(b * seq_len + s, h * HEAD_DIM + d);
-                }
-            }
-            for (size_t h = 0; h < NUM_KEY_VALUE_HEADS; h++) {
-                for (size_t d = 0; d < HEAD_DIM; d++) {
-                    k_reshaped.at(b, s, h, d) = k_proj_out.at(b * seq_len + s, h * HEAD_DIM + d);
-                    v_reshaped.at(b, s, h, d) = v_proj_out.at(b * seq_len + s, h * HEAD_DIM + d);
-                }
-            }
-        }
-    }
+    size_t total_q = batch * seq_len * NUM_ATTENTION_HEADS * HEAD_DIM;
+    size_t total_kv = batch * seq_len * NUM_KEY_VALUE_HEADS * HEAD_DIM;
+    int blocks_q = (total_q + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int blocks_kv = (total_kv + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    // Apply layernorm to Q and K (normalizes over last dim = head_dim)
+    reshape_proj_output_kernel<<<blocks_q, BLOCK_SIZE>>>(
+        q_proj_out.data(), q_reshaped.data(), batch, seq_len, NUM_ATTENTION_HEADS, HEAD_DIM);
+    reshape_proj_output_kernel<<<blocks_kv, BLOCK_SIZE>>>(
+        k_proj_out.data(), k_reshaped.data(), batch, seq_len, NUM_KEY_VALUE_HEADS, HEAD_DIM);
+    reshape_proj_output_kernel<<<blocks_kv, BLOCK_SIZE>>>(
+        v_proj_out.data(), v_reshaped.data(), batch, seq_len, NUM_KEY_VALUE_HEADS, HEAD_DIM);
+    CHECK_CUDA(cudaGetLastError());
+
     Tensor q_normed({batch, seq_len, NUM_ATTENTION_HEADS, HEAD_DIM});
     Tensor k_normed({batch, seq_len, NUM_KEY_VALUE_HEADS, HEAD_DIM});
     q_layernorm_->forward(q_reshaped, q_normed);
     k_layernorm_->forward(k_reshaped, k_normed);
 
-    // Transpose to (batch, num_heads, seq_len, head_dim) for attention
     Tensor q({batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM});
     Tensor k({batch, NUM_KEY_VALUE_HEADS, seq_len, HEAD_DIM});
     Tensor v({batch, NUM_KEY_VALUE_HEADS, seq_len, HEAD_DIM});
 
-    for (size_t b = 0; b < batch; b++) {
-        for (size_t s = 0; s < seq_len; s++) {
-            for (size_t h = 0; h < NUM_ATTENTION_HEADS; h++) {
-                for (size_t d = 0; d < HEAD_DIM; d++) {
-                    q.at(b, h, s, d) = q_normed.at(b, s, h, d);
-                }
-            }
-            for (size_t h = 0; h < NUM_KEY_VALUE_HEADS; h++) {
-                for (size_t d = 0; d < HEAD_DIM; d++) {
-                    k.at(b, h, s, d) = k_normed.at(b, s, h, d);
-                    v.at(b, h, s, d) = v_reshaped.at(b, s, h, d);
-                }
-            }
-        }
-    }
+    transpose_0213_kernel<<<blocks_q, BLOCK_SIZE>>>(
+        q_normed.data(), q.data(), batch, seq_len, NUM_ATTENTION_HEADS, HEAD_DIM);
+    transpose_0213_kernel<<<blocks_kv, BLOCK_SIZE>>>(
+        k_normed.data(), k.data(), batch, seq_len, NUM_KEY_VALUE_HEADS, HEAD_DIM);
+    transpose_0213_kernel<<<blocks_kv, BLOCK_SIZE>>>(
+        v_reshaped.data(), v.data(), batch, seq_len, NUM_KEY_VALUE_HEADS, HEAD_DIM);
+    CHECK_CUDA(cudaGetLastError());
 
-    // Apply RoPE
     tensor_ops::apply_rotary_pos_emb(q, k, cos, sin);
 
-    // Repeat K, V for GQA
     Tensor k_repeated({batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM});
     Tensor v_repeated({batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM});
     tensor_ops::repeat_kv(k, NUM_KEY_VALUE_GROUPS, k_repeated);
     tensor_ops::repeat_kv(v, NUM_KEY_VALUE_GROUPS, v_repeated);
 
-    // =========================================================================
-    // OPTIMIZATION 2.1: Flash Attention Implementation
-    // Uses tiled attention with online softmax for O(N) memory instead of O(N^2)
-    // Falls back to standard attention for very short sequences
-    // =========================================================================
+    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+    Tensor scores({batch, NUM_ATTENTION_HEADS, seq_len, seq_len});
 
-    float scale = 1.0f / std::sqrt((float)HEAD_DIM);
+    size_t total_scores = batch * NUM_ATTENTION_HEADS * seq_len * seq_len;
+    int blocks_scores = (total_scores + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    batched_attn_scores_kernel<<<blocks_scores, BLOCK_SIZE>>>(
+        q.data(), k_repeated.data(), scores.data(),
+        batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM, scale);
+    CHECK_CUDA(cudaGetLastError());
+
+    apply_causal_mask_kernel<<<blocks_scores, BLOCK_SIZE>>>(
+        scores.data(), batch, NUM_ATTENTION_HEADS, seq_len);
+    CHECK_CUDA(cudaGetLastError());
+
+    dim3 softmax_grid(batch * NUM_ATTENTION_HEADS, seq_len);
+    int softmax_threads = std::min((int)seq_len, BLOCK_SIZE);
+    size_t shared_mem = softmax_threads * sizeof(float);
+    batched_softmax_kernel<<<softmax_grid, softmax_threads, shared_mem>>>(
+        scores.data(), batch, NUM_ATTENTION_HEADS, seq_len);
+    CHECK_CUDA(cudaGetLastError());
+
     Tensor attn_output({batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM});
+    batched_attn_output_kernel<<<blocks_q, BLOCK_SIZE>>>(
+        scores.data(), v_repeated.data(), attn_output.data(),
+        batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM);
+    CHECK_CUDA(cudaGetLastError());
 
-    // Allocate GPU memory for attention computation
-    size_t qkv_size = batch * NUM_ATTENTION_HEADS * seq_len * HEAD_DIM;
-
-    // Use memory pool if available, otherwise allocate directly
-    float *d_q, *d_k, *d_v, *d_attn_output;
-    bool use_pool = GPUMemoryPool::instance().is_initialized();
-
-    if (use_pool) {
-        d_q = (float*)GPUMemoryPool::instance().allocate(qkv_size * sizeof(float));
-        d_k = (float*)GPUMemoryPool::instance().allocate(qkv_size * sizeof(float));
-        d_v = (float*)GPUMemoryPool::instance().allocate(qkv_size * sizeof(float));
-        d_attn_output = (float*)GPUMemoryPool::instance().allocate(qkv_size * sizeof(float));
-    } else {
-        cudaMalloc(&d_q, qkv_size * sizeof(float));
-        cudaMalloc(&d_k, qkv_size * sizeof(float));
-        cudaMalloc(&d_v, qkv_size * sizeof(float));
-        cudaMalloc(&d_attn_output, qkv_size * sizeof(float));
-    }
-
-    // Upload Q, K, V to GPU (already in (batch, num_heads, seq_len, head_dim) format)
-    cudaMemcpy(d_q, q.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, k_repeated.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, v_repeated.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Use Flash Attention for longer sequences (better memory efficiency)
-    // Use standard attention for very short sequences (less overhead)
-    bool use_flash_attn = (seq_len > 32);
-
-    if (use_flash_attn) {
-        // Flash Attention: O(N) memory, better for long sequences
-        // Shared memory size: 2 * FLASH_ATTN_BLOCK_SIZE * head_dim floats
-        size_t smem_size = 2 * FLASH_ATTN_BLOCK_SIZE * HEAD_DIM * sizeof(float);
-
-        // Process each (batch, head) pair with Flash Attention
-        for (size_t b = 0; b < batch; b++) {
-            for (size_t h = 0; h < NUM_ATTENTION_HEADS; h++) {
-                size_t bh_offset = (b * NUM_ATTENTION_HEADS + h);
-                float* q_ptr = d_q + bh_offset * seq_len * HEAD_DIM;
-                float* k_ptr = d_k + bh_offset * seq_len * HEAD_DIM;
-                float* v_ptr = d_v + bh_offset * seq_len * HEAD_DIM;
-                float* out_ptr = d_attn_output + bh_offset * seq_len * HEAD_DIM;
-
-                // Launch Flash Attention kernel - one block per query position
-                flash_attention_kernel<<<seq_len, 32, smem_size>>>(
-                    q_ptr, k_ptr, v_ptr, out_ptr, seq_len, HEAD_DIM, scale);
-            }
-        }
-    } else {
-        // Standard attention for short sequences
-        // Allocate scores matrix
-        size_t scores_size = batch * NUM_ATTENTION_HEADS * seq_len * seq_len;
-        float* d_scores;
-        if (use_pool) {
-            d_scores = (float*)GPUMemoryPool::instance().allocate(scores_size * sizeof(float));
-        } else {
-            cudaMalloc(&d_scores, scores_size * sizeof(float));
-        }
-
-        // Process each (batch, head) pair
-        for (size_t b = 0; b < batch; b++) {
-            for (size_t h = 0; h < NUM_ATTENTION_HEADS; h++) {
-                size_t bh_offset = (b * NUM_ATTENTION_HEADS + h);
-                float* q_ptr = d_q + bh_offset * seq_len * HEAD_DIM;
-                float* k_ptr = d_k + bh_offset * seq_len * HEAD_DIM;
-                float* scores_ptr = d_scores + bh_offset * seq_len * seq_len;
-                float* v_ptr = d_v + bh_offset * seq_len * HEAD_DIM;
-                float* out_ptr = d_attn_output + bh_offset * seq_len * HEAD_DIM;
-
-                // Compute attention scores: scores[i,j] = sum_d Q[i,d] * K[j,d] * scale
-                dim3 attn_scores_grid(seq_len, seq_len);
-                attention_scores_kernel<<<attn_scores_grid, 32>>>(
-                    q_ptr, k_ptr, scores_ptr, seq_len, HEAD_DIM, scale);
-
-                // Apply causal mask and softmax
-                causal_softmax_kernel<<<seq_len, 32>>>(scores_ptr, seq_len);
-
-                // Compute attention output: out[i,d] = sum_j scores[i,j] * V[j,d]
-                dim3 attn_out_grid((HEAD_DIM + 31) / 32, seq_len);
-                attention_output_kernel<<<attn_out_grid, 32>>>(
-                    scores_ptr, v_ptr, out_ptr, seq_len, HEAD_DIM);
-            }
-        }
-
-        if (!use_pool) {
-            cudaFree(d_scores);
-        }
-    }
-
-    // Download attention output
-    cudaMemcpy(attn_output.data(), d_attn_output, qkv_size * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Free GPU memory (only if not using pool)
-    if (!use_pool) {
-        cudaFree(d_q);
-        cudaFree(d_k);
-        cudaFree(d_v);
-        cudaFree(d_attn_output);
-    }
-
-    // Reshape and project output
     Tensor attn_flat({batch * seq_len, hidden_size});
-    for (size_t b = 0; b < batch; b++) {
-        for (size_t s = 0; s < seq_len; s++) {
-            for (size_t h = 0; h < NUM_ATTENTION_HEADS; h++) {
-                for (size_t d = 0; d < HEAD_DIM; d++) {
-                    attn_flat.at(b * seq_len + s, h * HEAD_DIM + d) = attn_output.at(b, h, s, d);
-                }
-            }
-        }
-    }
+    flatten_attn_output_kernel<<<blocks_q, BLOCK_SIZE>>>(
+        attn_output.data(), attn_flat.data(), batch, NUM_ATTENTION_HEADS, seq_len, HEAD_DIM);
+    CHECK_CUDA(cudaGetLastError());
 
     Tensor output_flat({batch * seq_len, hidden_size});
     tensor_ops::matmul_transposed(attn_flat, o_proj_, output_flat);
 
     output_flat.reshape({batch, seq_len, hidden_size});
 
-    // Allocate output if needed
     if (output.size() == 0) {
         output = Tensor({batch, seq_len, hidden_size});
     }
-    std::memcpy(output.data(), output_flat.data(), output.size() * sizeof(float));
+    CHECK_CUDA(cudaMemcpy(output.data(), output_flat.data(), output.size() * sizeof(float), cudaMemcpyDeviceToDevice));
 }
 
-// ShortConv implementation
+// ============================================================================
+// ShortConv Implementation
+// ============================================================================
+
 ShortConv::ShortConv(int layer_idx) : layer_idx_(layer_idx) {
     std::stringstream ss_conv, ss_in, ss_out;
     ss_conv << "layers." << layer_idx << ".conv.conv.weight";
@@ -1481,106 +775,78 @@ ShortConv::ShortConv(int layer_idx) : layer_idx_(layer_idx) {
 }
 
 void ShortConv::forward(const Tensor& x, Tensor& y) {
-    // =========================================================================
-    // OPTIMIZATION 2.1: Fused ShortConv with GPU Kernels
-    // Combines: in_proj -> transpose -> split -> B*x_gate -> conv1d -> C*conv -> transpose -> out_proj
-    // =========================================================================
-
-    // x: (batch, seq_len, hidden_size)
     size_t batch = x.size(0);
     size_t seq_len = x.size(1);
     size_t hidden_size = x.size(2);
-    size_t kernel_size = CONV_KERNEL;
 
-    // Flatten for matmul
     Tensor x_flat = x.view({batch * seq_len, hidden_size});
 
-    // in_proj: (batch*seq_len, hidden_size) @ (3*hidden_size, hidden_size)^T -> (batch*seq_len, 3*hidden_size)
     Tensor in_proj_out({batch * seq_len, 3 * hidden_size});
     tensor_ops::matmul_transposed(x_flat, in_proj_weight_, in_proj_out);
 
-    // Allocate GPU memory for fused operations
-    size_t bhs = batch * hidden_size * seq_len;
-    float *d_in_proj, *d_B, *d_C, *d_x_gate, *d_conv_out, *d_y_pre;
-    float *d_conv_weight, *d_in_bias, *d_out_bias;
-
-    cudaMalloc(&d_in_proj, batch * seq_len * 3 * hidden_size * sizeof(float));
-    cudaMalloc(&d_B, bhs * sizeof(float));
-    cudaMalloc(&d_C, bhs * sizeof(float));
-    cudaMalloc(&d_x_gate, bhs * sizeof(float));
-    cudaMalloc(&d_conv_out, bhs * sizeof(float));
-    cudaMalloc(&d_y_pre, batch * seq_len * hidden_size * sizeof(float));
-    cudaMalloc(&d_conv_weight, hidden_size * kernel_size * sizeof(float));
-
-    // Upload data to GPU
-    cudaMemcpy(d_in_proj, in_proj_out.data(), batch * seq_len * 3 * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_conv_weight, conv_weight_.data(), hidden_size * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Add in_proj bias on GPU if present
     if (USE_CONV_BIAS && in_proj_bias_.size() > 0) {
-        cudaMalloc(&d_in_bias, 3 * hidden_size * sizeof(float));
-        cudaMemcpy(d_in_bias, in_proj_bias_.data(), 3 * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-        int bias_blocks = (batch * seq_len * 3 * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        add_bias_kernel<<<bias_blocks, BLOCK_SIZE>>>(d_in_proj, d_in_bias, batch * seq_len, 3 * hidden_size);
-        cudaFree(d_in_bias);
+        int blocks = (batch * seq_len * 3 * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        add_bias_kernel<<<blocks, BLOCK_SIZE>>>(in_proj_out.data(), in_proj_bias_.data(),
+                                                  batch * seq_len, 3 * hidden_size);
+        CHECK_CUDA(cudaGetLastError());
     }
 
-    // Fused transpose and split: (batch*seq_len, 3*hidden) -> B, C, x_gate (each batch, hidden, seq)
-    int split_blocks = (bhs + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    fused_transpose_split_kernel<<<split_blocks, BLOCK_SIZE>>>(
-        d_in_proj, d_B, d_C, d_x_gate, batch, seq_len, hidden_size);
+    Tensor BCx({batch, 3 * hidden_size, seq_len});
+    size_t total_bcx = batch * 3 * hidden_size * seq_len;
+    int blocks_bcx = (total_bcx + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    transpose_conv_kernel<<<blocks_bcx, BLOCK_SIZE>>>(
+        in_proj_out.data(), BCx.data(), batch, seq_len, 3 * hidden_size);
+    CHECK_CUDA(cudaGetLastError());
 
-    // Fused B*x_gate and causal conv1d
-    fused_mul_conv1d_kernel<<<split_blocks, BLOCK_SIZE>>>(
-        d_B, d_x_gate, d_conv_weight, d_conv_out, batch, hidden_size, seq_len, kernel_size);
+    Tensor B({batch, hidden_size, seq_len});
+    Tensor C({batch, hidden_size, seq_len});
+    Tensor x_gate({batch, hidden_size, seq_len});
 
-    // Fused C*conv_out and transpose to (batch, seq_len, hidden)
-    int transpose_blocks = (batch * seq_len * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    fused_mul_transpose_kernel<<<transpose_blocks, BLOCK_SIZE>>>(
-        d_C, d_conv_out, d_y_pre, batch, seq_len, hidden_size);
+    size_t total_split = batch * hidden_size * seq_len;
+    int blocks_split = (total_split + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    split_bcx_kernel<<<blocks_split, BLOCK_SIZE>>>(
+        BCx.data(), B.data(), C.data(), x_gate.data(), batch, hidden_size, seq_len);
+    CHECK_CUDA(cudaGetLastError());
 
-    // Download y_pre for out_proj matmul
+    Tensor Bx({batch, hidden_size, seq_len});
+    tensor_ops::mul(B, x_gate, Bx);
+
+    Tensor conv_out({batch, hidden_size, seq_len});
+    tensor_ops::causal_conv1d(Bx, conv_weight_, USE_CONV_BIAS ? &conv_bias_ : nullptr, conv_out);
+
+    Tensor y_pre({batch, hidden_size, seq_len});
+    tensor_ops::mul(C, conv_out, y_pre);
+
     Tensor y_pre_transposed({batch, seq_len, hidden_size});
-    cudaMemcpy(y_pre_transposed.data(), d_y_pre, batch * seq_len * hidden_size * sizeof(float), cudaMemcpyDeviceToHost);
+    size_t total_trans = batch * seq_len * hidden_size;
+    int blocks_trans = (total_trans + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    transpose_conv_reverse_kernel<<<blocks_trans, BLOCK_SIZE>>>(
+        y_pre.data(), y_pre_transposed.data(), batch, hidden_size, seq_len);
+    CHECK_CUDA(cudaGetLastError());
 
-    // Free GPU memory
-    cudaFree(d_in_proj);
-    cudaFree(d_B);
-    cudaFree(d_C);
-    cudaFree(d_x_gate);
-    cudaFree(d_conv_out);
-    cudaFree(d_y_pre);
-    cudaFree(d_conv_weight);
-
-    // out_proj: (batch*seq_len, hidden_size) @ (hidden_size, hidden_size)^T -> (batch*seq_len, hidden_size)
     Tensor y_pre_flat = y_pre_transposed.view({batch * seq_len, hidden_size});
     Tensor y_flat({batch * seq_len, hidden_size});
     tensor_ops::matmul_transposed(y_pre_flat, out_proj_weight_, y_flat);
 
-    // Add out_proj bias if present (on GPU for efficiency)
     if (USE_CONV_BIAS && out_proj_bias_.size() > 0) {
-        float *d_y_flat;
-        cudaMalloc(&d_y_flat, batch * seq_len * hidden_size * sizeof(float));
-        cudaMalloc(&d_out_bias, hidden_size * sizeof(float));
-        cudaMemcpy(d_y_flat, y_flat.data(), batch * seq_len * hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_out_bias, out_proj_bias_.data(), hidden_size * sizeof(float), cudaMemcpyHostToDevice);
-        int bias_blocks = (batch * seq_len * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        add_bias_kernel<<<bias_blocks, BLOCK_SIZE>>>(d_y_flat, d_out_bias, batch * seq_len, hidden_size);
-        cudaMemcpy(y_flat.data(), d_y_flat, batch * seq_len * hidden_size * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaFree(d_y_flat);
-        cudaFree(d_out_bias);
+        int blocks = (batch * seq_len * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        add_bias_kernel<<<blocks, BLOCK_SIZE>>>(y_flat.data(), out_proj_bias_.data(),
+                                                  batch * seq_len, hidden_size);
+        CHECK_CUDA(cudaGetLastError());
     }
 
-    // Reshape back to (batch, seq_len, hidden_size)
     y_flat.reshape({batch, seq_len, hidden_size});
 
     if (y.size() == 0) {
         y = Tensor({batch, seq_len, hidden_size});
     }
-    std::memcpy(y.data(), y_flat.data(), y.size() * sizeof(float));
+    CHECK_CUDA(cudaMemcpy(y.data(), y_flat.data(), y.size() * sizeof(float), cudaMemcpyDeviceToDevice));
 }
 
-// DecoderLayer implementation
+// ============================================================================
+// DecoderLayer Implementation
+// ============================================================================
+
 DecoderLayer::DecoderLayer(int layer_idx, bool is_attention_layer)
     : layer_idx_(layer_idx), is_attention_layer_(is_attention_layer) {
 
@@ -1610,11 +876,9 @@ DecoderLayer::DecoderLayer(int layer_idx, bool is_attention_layer)
 
 void DecoderLayer::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
                           const Tensor* attention_mask, Tensor& output) {
-    // Input norm
     Tensor normed_input(x.shape());
     input_layernorm_->forward(x, normed_input);
 
-    // Attention or Conv
     Tensor attn_output(x.shape());
     if (is_attention_layer_) {
         self_attn_->forward(normed_input, cos, sin, attention_mask, attn_output);
@@ -1622,40 +886,32 @@ void DecoderLayer::forward(const Tensor& x, const Tensor& cos, const Tensor& sin
         short_conv_->forward(normed_input, attn_output);
     }
 
-    // Residual connection
     Tensor hidden_states(x.shape());
     tensor_ops::add(x, attn_output, hidden_states);
 
-    // Post attention norm
     Tensor normed_hidden(x.shape());
     post_attention_layernorm_->forward(hidden_states, normed_hidden);
 
-    // MoE block or dense MLP
     Tensor ffn_output;
     if (moe_block_) {
-        // MoE layer (layers >= 2)
         Tensor router_logits;
         moe_block_->forward(normed_hidden, ffn_output, router_logits);
     } else {
-        // Dense layer (layers 0-1)
         dense_mlp_->forward(normed_hidden, ffn_output);
     }
 
-    // Residual connection
     tensor_ops::add(hidden_states, ffn_output, output);
 }
 
 // ============================================================================
-// LFM2Model Implementation - Complete model
+// LFM2Model Implementation
 // ============================================================================
 
 LFM2Model::LFM2Model(const std::string& model_file) {
-    std::cout << "Loading LFM2-8B-A1B model from " << model_file << std::endl;
+    if (g_parallel_ctx.world_rank == 0) {
+        std::cout << "Loading LFM2-8B-A1B model from " << model_file << std::endl;
+    }
 
-    // Initialize multi-GPU
-    init_multi_gpu();
-
-    // Initialize global model loader
     g_model_loader = std::make_unique<ModelLoader>(model_file);
 
     load_embeddings();
@@ -1664,99 +920,40 @@ LFM2Model::LFM2Model(const std::string& model_file) {
 
     rotary_emb_ = std::make_unique<RotaryEmbedding>();
 
-    // =========================================================================
-    // OPTIMIZATION 1.3: Initialize GPU Memory Pool
-    // Pre-allocate large memory pool for intermediate buffers
-    // This eliminates cudaMalloc/cudaFree overhead during forward passes
-    // =========================================================================
-    size_t max_seq_len = 4096;  // Maximum expected sequence length
-    size_t max_batch = 8;       // Maximum batch size
-
-    // Calculate pool size: enough for attention QKV + scores + intermediates
-    // Per forward pass needs approximately:
-    // - Attention: 4 * batch * heads * seq * head_dim (Q,K,V,O)
-    // - Scores: batch * heads * seq * seq (only for non-flash attention)
-    // - MLP intermediates: batch * seq * intermediate_size * 4
-    // - Misc buffers: 2x safety factor
-    size_t pool_size = max_batch * max_seq_len * (
-        4 * NUM_ATTENTION_HEADS * HEAD_DIM +  // QKV + Output
-        NUM_ATTENTION_HEADS * max_seq_len +    // Scores (conservative)
-        4 * INTERMEDIATE_SIZE                   // MLP intermediates
-    ) * sizeof(float) * 2;  // 2x safety factor
-
-    // Cap at 2GB to avoid excessive allocation
-    pool_size = std::min(pool_size, (size_t)(2ULL * 1024 * 1024 * 1024));
-
-    std::cout << "Initializing GPU optimizations..." << std::endl;
-    GPUMemoryPool::instance().init(pool_size);
-
-    // =========================================================================
-    // OPTIMIZATION 1.1: Upload persistent weights to GPU
-    // This eliminates weight transfer overhead during forward passes
-    // =========================================================================
-    init_persistent_gpu_weights();
-
-    std::cout << "Model loaded successfully!" << std::endl;
-}
-
-LFM2Model::~LFM2Model() {
-    // Clean up CUDA graph if captured
-    if (cuda_graph_exec_) {
-        cudaGraphExecDestroy(cuda_graph_exec_);
+    if (g_parallel_ctx.world_rank == 0) {
+        std::cout << "Model loaded successfully!" << std::endl;
     }
-    if (cuda_graph_) {
-        cudaGraphDestroy(cuda_graph_);
-    }
-}
-
-void LFM2Model::init_persistent_gpu_weights() {
-    std::cout << "  Uploading weights to GPU (persistent storage)..." << std::endl;
-
-    // Upload embedding table
-    float* d_embed;
-    cudaMalloc(&d_embed, embed_tokens_.size() * sizeof(float));
-    cudaMemcpy(d_embed, embed_tokens_.data(), embed_tokens_.size() * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Upload LM head
-    float* d_lm_head;
-    cudaMalloc(&d_lm_head, lm_head_.size() * sizeof(float));
-    cudaMemcpy(d_lm_head, lm_head_.data(), lm_head_.size() * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Upload final norm weight
-    float* d_final_norm;
-    cudaMalloc(&d_final_norm, norm_->weight().size() * sizeof(float));
-    cudaMemcpy(d_final_norm, norm_->weight().data(), norm_->weight().size() * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Store pointers (note: these would be used by optimized forward pass)
-    // For now we mark that GPU weights are initialized
-    gpu_weights_initialized_ = true;
-
-    // Calculate total GPU memory used for weights
-    size_t total_weight_mem = embed_tokens_.size() + lm_head_.size() + norm_->weight().size();
-    total_weight_mem *= sizeof(float);
-
-    std::cout << "  Persistent weight memory: " << (total_weight_mem / (1024*1024)) << " MB" << std::endl;
 }
 
 void LFM2Model::load_embeddings() {
-    std::cout << "Loading embeddings..." << std::endl;
+    if (g_parallel_ctx.world_rank == 0) {
+        std::cout << "Loading embeddings..." << std::endl;
+    }
     embed_tokens_ = Tensor::load_from_file("embed_tokens.weight");
-    std::cout << "  Embeddings shape: " << embed_tokens_.size(0) << " x " << embed_tokens_.size(1) << std::endl;
+    if (g_parallel_ctx.world_rank == 0) {
+        std::cout << "  Embeddings shape: " << embed_tokens_.size(0) << " x " << embed_tokens_.size(1) << std::endl;
+    }
 }
 
 void LFM2Model::load_layers() {
-    std::cout << "Loading " << NUM_HIDDEN_LAYERS << " decoder layers..." << std::endl;
+    if (g_parallel_ctx.world_rank == 0) {
+        std::cout << "Loading " << NUM_HIDDEN_LAYERS << " decoder layers..." << std::endl;
+    }
 
     layers_.reserve(NUM_HIDDEN_LAYERS);
     for (size_t i = 0; i < NUM_HIDDEN_LAYERS; i++) {
         bool is_attention = (LAYER_TYPES[i] == 0);
-        std::cout << "  Layer " << i << ": " << (is_attention ? "Attention" : "Conv") << std::endl;
+        if (g_parallel_ctx.world_rank == 0) {
+            std::cout << "  Layer " << i << ": " << (is_attention ? "Attention" : "Conv") << std::endl;
+        }
         layers_.push_back(std::make_unique<DecoderLayer>(i, is_attention));
     }
 }
 
 void LFM2Model::load_output_layers() {
-    std::cout << "Loading output layers..." << std::endl;
+    if (g_parallel_ctx.world_rank == 0) {
+        std::cout << "Loading output layers..." << std::endl;
+    }
 
     norm_ = std::make_unique<RMSNorm>("embedding_norm.weight");
 
@@ -1764,7 +961,9 @@ void LFM2Model::load_output_layers() {
         lm_head_ = Tensor::load_from_file("lm_head.weight");
     } else {
         lm_head_ = embed_tokens_;
-        std::cout << "  Using tied weights for LM head" << std::endl;
+        if (g_parallel_ctx.world_rank == 0) {
+            std::cout << "  Using tied weights for LM head" << std::endl;
+        }
     }
 }
 
@@ -1772,252 +971,40 @@ void LFM2Model::forward(const std::vector<int>& input_ids, Tensor& logits) {
     size_t batch = 1;
     size_t seq_len = input_ids.size();
 
-    // =========================================================================
-    // Reset memory pool for this forward pass
-    // =========================================================================
-    if (GPUMemoryPool::instance().is_initialized()) {
-        GPUMemoryPool::instance().reset();
-    }
-
-    // =========================================================================
-    // OPTIMIZATION 2.3: GPU Embedding Lookup with Memory Pool
-    // =========================================================================
+    int* d_input_ids;
+    CHECK_CUDA(cudaMalloc(&d_input_ids, seq_len * sizeof(int)));
+    CHECK_CUDA(cudaMemcpy(d_input_ids, input_ids.data(), seq_len * sizeof(int), cudaMemcpyHostToDevice));
 
     Tensor hidden_states({batch, seq_len, HIDDEN_SIZE});
+    size_t total = seq_len * HIDDEN_SIZE;
+    int blocks = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    embedding_lookup_kernel<<<blocks, BLOCK_SIZE>>>(
+        embed_tokens_.data(), d_input_ids, hidden_states.data(), seq_len, HIDDEN_SIZE);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaFree(d_input_ids));
 
-    // Use memory pool if available
-    bool use_pool = GPUMemoryPool::instance().is_initialized();
-    int* d_tokens;
-    float *d_embed_table, *d_output;
-
-    if (use_pool) {
-        d_tokens = (int*)GPUMemoryPool::instance().allocate(seq_len * sizeof(int));
-        d_embed_table = (float*)GPUMemoryPool::instance().allocate(VOCAB_SIZE * HIDDEN_SIZE * sizeof(float));
-        d_output = (float*)GPUMemoryPool::instance().allocate(seq_len * HIDDEN_SIZE * sizeof(float));
-    } else {
-        cudaMalloc(&d_tokens, seq_len * sizeof(int));
-        cudaMalloc(&d_embed_table, VOCAB_SIZE * HIDDEN_SIZE * sizeof(float));
-        cudaMalloc(&d_output, seq_len * HIDDEN_SIZE * sizeof(float));
-    }
-
-    // Upload tokens and embedding table to GPU
-    cudaMemcpy(d_tokens, input_ids.data(), seq_len * sizeof(int), cudaMemcpyHostToDevice);
-
-    // Upload embedding table (persistent weights would eliminate this)
-    cudaMemcpy(d_embed_table, embed_tokens_.data(), VOCAB_SIZE * HIDDEN_SIZE * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Launch embedding lookup kernel
-    int total_elements = seq_len * HIDDEN_SIZE;
-    int blocks = (total_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    embedding_lookup_kernel<<<blocks, BLOCK_SIZE>>>(d_tokens, d_embed_table, d_output, seq_len, HIDDEN_SIZE);
-
-    // Download result
-    cudaMemcpy(hidden_states.data(), d_output, seq_len * HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Free GPU memory only if not using pool
-    if (!use_pool) {
-        cudaFree(d_tokens);
-        cudaFree(d_embed_table);
-        cudaFree(d_output);
-    }
-
-    // Compute RoPE embeddings
     Tensor cos({seq_len, HEAD_DIM});
     Tensor sin({seq_len, HEAD_DIM});
     rotary_emb_->forward(seq_len, cos, sin);
 
-    // Create causal attention mask (not strictly needed for CPU impl)
     Tensor* attention_mask = nullptr;
 
-    // Pass through decoder layers
     for (size_t i = 0; i < NUM_HIDDEN_LAYERS; i++) {
         Tensor output({batch, seq_len, HIDDEN_SIZE});
         layers_[i]->forward(hidden_states, cos, sin, attention_mask, output);
-        hidden_states = output;
+        hidden_states = std::move(output);
     }
 
-    // Final norm
     Tensor normed_output({batch, seq_len, HIDDEN_SIZE});
     norm_->forward(hidden_states, normed_output);
 
-    // LM head projection (only for last token in generation)
     Tensor last_hidden({batch, 1, HIDDEN_SIZE});
-    for (size_t i = 0; i < HIDDEN_SIZE; i++) {
-        last_hidden.at(0, 0, i) = normed_output.at(0, seq_len - 1, i);
-    }
+    int blocks_copy = (HIDDEN_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    copy_last_token_kernel<<<blocks_copy, BLOCK_SIZE>>>(
+        normed_output.data(), last_hidden.data(), seq_len, HIDDEN_SIZE);
+    CHECK_CUDA(cudaGetLastError());
 
     Tensor last_hidden_flat = last_hidden.view({batch, HIDDEN_SIZE});
     logits = Tensor({batch, VOCAB_SIZE});
     tensor_ops::matmul_transposed(last_hidden_flat, lm_head_, logits);
-}
-
-// ============================================================================
-// OPTIMIZATION 3.2: Batched Forward Pass for Multiple Sequences
-// ============================================================================
-
-void LFM2Model::forward_batch(const std::vector<std::vector<int>>& input_ids_batch,
-                               std::vector<Tensor>& logits_batch) {
-    size_t num_sequences = input_ids_batch.size();
-    if (num_sequences == 0) return;
-
-    // Find max sequence length for padding
-    size_t max_seq_len = 0;
-    for (const auto& seq : input_ids_batch) {
-        max_seq_len = std::max(max_seq_len, seq.size());
-    }
-
-    // Process sequences in true batch (batch > 1)
-    size_t batch = num_sequences;
-
-    // Create padded input tensor
-    Tensor hidden_states({batch, max_seq_len, HIDDEN_SIZE});
-    hidden_states.zero();
-
-    // GPU-accelerated batched embedding lookup
-    int* d_tokens;
-    float *d_embed_table, *d_output;
-    size_t total_tokens = batch * max_seq_len;
-
-    cudaMalloc(&d_tokens, total_tokens * sizeof(int));
-    cudaMalloc(&d_embed_table, VOCAB_SIZE * HIDDEN_SIZE * sizeof(float));
-    cudaMalloc(&d_output, total_tokens * HIDDEN_SIZE * sizeof(float));
-
-    // Create padded token array (pad with 0s)
-    std::vector<int> padded_tokens(total_tokens, 0);
-    for (size_t b = 0; b < batch; b++) {
-        for (size_t s = 0; s < input_ids_batch[b].size(); s++) {
-            padded_tokens[b * max_seq_len + s] = input_ids_batch[b][s];
-        }
-    }
-
-    // Upload tokens and embedding table
-    cudaMemcpy(d_tokens, padded_tokens.data(), total_tokens * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_embed_table, embed_tokens_.data(), VOCAB_SIZE * HIDDEN_SIZE * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Launch batched embedding lookup
-    int total_elements = total_tokens * HIDDEN_SIZE;
-    int blocks = (total_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    embedding_lookup_kernel<<<blocks, BLOCK_SIZE>>>(d_tokens, d_embed_table, d_output, total_tokens, HIDDEN_SIZE);
-
-    // Download embeddings
-    cudaMemcpy(hidden_states.data(), d_output, total_tokens * HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_tokens);
-    cudaFree(d_embed_table);
-    cudaFree(d_output);
-
-    // Compute RoPE embeddings
-    Tensor cos({max_seq_len, HEAD_DIM});
-    Tensor sin({max_seq_len, HEAD_DIM});
-    rotary_emb_->forward(max_seq_len, cos, sin);
-
-    // Pass through decoder layers
-    Tensor* attention_mask = nullptr;
-    for (size_t i = 0; i < NUM_HIDDEN_LAYERS; i++) {
-        Tensor output({batch, max_seq_len, HIDDEN_SIZE});
-        layers_[i]->forward(hidden_states, cos, sin, attention_mask, output);
-        hidden_states = output;
-    }
-
-    // Final norm
-    Tensor normed_output({batch, max_seq_len, HIDDEN_SIZE});
-    norm_->forward(hidden_states, normed_output);
-
-    // Extract last token for each sequence and compute logits
-    logits_batch.resize(batch);
-
-    // Get actual sequence lengths for each batch item
-    std::vector<size_t> seq_lengths(batch);
-    for (size_t b = 0; b < batch; b++) {
-        seq_lengths[b] = input_ids_batch[b].size();
-    }
-
-    // Process all sequences together for LM head
-    Tensor last_hidden({batch, 1, HIDDEN_SIZE});
-    for (size_t b = 0; b < batch; b++) {
-        size_t last_pos = seq_lengths[b] - 1;
-        for (size_t i = 0; i < HIDDEN_SIZE; i++) {
-            last_hidden.at(b, 0, i) = normed_output.at(b, last_pos, i);
-        }
-    }
-
-    Tensor last_hidden_flat = last_hidden.view({batch, HIDDEN_SIZE});
-    Tensor all_logits({batch, VOCAB_SIZE});
-    tensor_ops::matmul_transposed(last_hidden_flat, lm_head_, all_logits);
-
-    // Split logits into individual tensors
-    for (size_t b = 0; b < batch; b++) {
-        logits_batch[b] = Tensor({1, VOCAB_SIZE});
-        for (size_t v = 0; v < VOCAB_SIZE; v++) {
-            logits_batch[b].at(0, v) = all_logits.at(b, v);
-        }
-    }
-}
-
-// ============================================================================
-// OPTIMIZATION 3.3: CUDA Graph Support
-// Captures the forward pass as a CUDA graph for reduced launch overhead
-// ============================================================================
-
-void LFM2Model::capture_cuda_graph(size_t seq_len) {
-    // Note: CUDA graphs require fixed sequence lengths
-    // This function would capture the GPU kernels for a specific sequence length
-    // For now, this is a placeholder that shows the pattern
-
-    std::cout << "Capturing CUDA graph for seq_len=" << seq_len << "..." << std::endl;
-
-    // Clean up previous graph if exists
-    if (cuda_graph_exec_) {
-        cudaGraphExecDestroy(cuda_graph_exec_);
-        cuda_graph_exec_ = nullptr;
-    }
-    if (cuda_graph_) {
-        cudaGraphDestroy(cuda_graph_);
-        cuda_graph_ = nullptr;
-    }
-
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    // Begin capture
-    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-
-    // The actual kernel launches would go here
-    // For a complete implementation, we would:
-    // 1. Pre-allocate all buffers for the fixed seq_len
-    // 2. Launch all kernels (embedding, attention, MLP, etc.) on the stream
-    // 3. End capture
-
-    // End capture
-    cudaStreamEndCapture(stream, &cuda_graph_);
-
-    // Instantiate the graph
-    cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, nullptr, nullptr, 0);
-
-    cudaStreamDestroy(stream);
-
-    cuda_graph_captured_ = true;
-    captured_seq_len_ = seq_len;
-
-    std::cout << "  CUDA graph captured successfully" << std::endl;
-}
-
-void LFM2Model::forward_with_cuda_graph(const std::vector<int>& input_ids, Tensor& logits) {
-    size_t seq_len = input_ids.size();
-
-    // Check if we need to recapture for different sequence length
-    if (!cuda_graph_captured_ || seq_len != captured_seq_len_) {
-        // Fall back to regular forward for now
-        // In a full implementation, we'd capture a new graph
-        forward(input_ids, logits);
-        return;
-    }
-
-    // Execute the captured graph
-    // Note: This requires pre-allocated input/output buffers that the graph references
-    cudaGraphLaunch(cuda_graph_exec_, 0);
-    cudaDeviceSynchronize();
-
-    // Copy results from pre-allocated GPU buffers to output tensor
-    // (This would be filled in with actual implementation)
 }

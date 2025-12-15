@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <cuda_runtime.h>
 
 /* Macro for checking CUDA errors */
 #define CHECK_CUDA(call)                                                 \
@@ -24,14 +25,14 @@ class Tensor {
 public:
     // Constructors
     Tensor();
-    Tensor(const std::vector<size_t>& shape);
-    Tensor(const std::vector<size_t>& shape, float* data, bool copy = true);
+    Tensor(const std::vector<size_t>& shape, bool on_gpu = true);
+    Tensor(const std::vector<size_t>& shape, float* data, bool copy = true, bool on_gpu = false);
     ~Tensor();
-    
+
     // Copy constructor and assignment
     Tensor(const Tensor& other);
     Tensor& operator=(const Tensor& other);
-    
+
     // Move constructor and assignment
     Tensor(Tensor&& other) noexcept;
     Tensor& operator=(Tensor&& other) noexcept;
@@ -41,52 +42,78 @@ public:
     const std::vector<size_t>& shape() const { return shape_; }
     size_t size() const { return size_; }
     size_t size(int dim) const;
-    
-    // Data access
-    float* data() { return data_; }
-    const float* data() const { return data_; }
-    float& operator[](size_t idx) { return data_[idx]; }
-    const float& operator[](size_t idx) const { return data_[idx]; }
-    
-    // Element access
+
+    // Data access - GPU data
+    float* data() { return d_data_; }
+    const float* data() const { return d_data_; }
+
+    // CPU data access (for compatibility)
+    float* host_data();
+    const float* host_data() const;
+
+    float& operator[](size_t idx);
+    const float& operator[](size_t idx) const;
+
+    // Element access (CPU side - syncs if needed)
     float& at(size_t i);
     float& at(size_t i, size_t j);
     float& at(size_t i, size_t j, size_t k);
     float& at(size_t i, size_t j, size_t k, size_t l);
-    
+
     const float& at(size_t i) const;
     const float& at(size_t i, size_t j) const;
     const float& at(size_t i, size_t j, size_t k) const;
     const float& at(size_t i, size_t j, size_t k, size_t l) const;
-    
+
     // Reshape
     void reshape(const std::vector<size_t>& new_shape);
     Tensor view(const std::vector<size_t>& new_shape) const;
-    
+
     // IO operations
     static Tensor load_from_file(const std::string& filename, ModelLoader* loader = nullptr);
     void save_to_file(const std::string& filename) const;
-    
+
     // Tensor operations
     Tensor transpose(int dim0, int dim1) const;
     Tensor slice(int dim, size_t start, size_t end) const;
     Tensor copy() const;
-    
+
     // Fill operations
     void fill(float value);
     void zero();
     void ones();
 
+    // GPU/CPU sync operations
+    void to_gpu();
+    void to_cpu();
+    void sync_to_host() const;
+    void sync_to_device();
+    bool is_on_gpu() const { return on_gpu_; }
+
+    // Async GPU/CPU sync operations with CUDA streams
+    void sync_to_host_async(cudaStream_t stream) const;
+    void sync_to_device_async(cudaStream_t stream);
+
+    // Mark device data as valid (after manual cudaMemcpy)
+    void mark_device_valid() { device_valid_ = true; host_valid_ = false; }
+    void mark_host_valid() const { host_valid_ = true; }
+
 private:
     std::vector<size_t> shape_;
     size_t size_;
-    float* data_;
+    float* d_data_;           // GPU data
+    mutable float* h_data_;   // CPU data (cached)
     bool owns_data_;
-    
+    bool on_gpu_;
+    mutable bool host_valid_; // Is host cache valid?
+    mutable bool device_valid_; // Is device data valid?
+    mutable bool host_pinned_; // Is host memory pinned?
+
     void allocate();
     void deallocate();
     size_t compute_size() const;
     size_t compute_stride(int dim) const;
+    void ensure_host_data() const;
 };
 
 // Tensor operations
