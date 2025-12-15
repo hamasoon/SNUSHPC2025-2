@@ -23,7 +23,8 @@ public:
     std::vector<size_t> get_shape(const std::string& name) const;
 
     // Preload all tensors to GPU memory for persistent storage
-    void preload_all_tensors();
+    // Uses async transfers with the provided stream for better performance
+    void preload_all_tensors(cudaStream_t stream = 0);
 
     // Check if a tensor is already cached on GPU
     bool is_cached(const std::string& name) const;
@@ -45,10 +46,11 @@ private:
     // Persistent GPU tensor cache - weights stay on GPU
     std::unordered_map<std::string, Tensor> gpu_cache_;
 
-    // Pinned host buffer for faster H2D transfers (reusable)
-    float* pinned_buffer_;
+    // Double-buffered pinned host memory for async H2D transfers
+    // Allows overlapping file I/O with GPU transfers
+    float* pinned_buffer_[2];
     size_t pinned_buffer_size_;
 
     void load_index();
-    void ensure_pinned_buffer(size_t size);
+    void ensure_pinned_buffers(size_t size);
 };

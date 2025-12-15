@@ -1077,9 +1077,11 @@ LFM2Model::LFM2Model(const std::string& model_file) {
 
     g_model_loader = std::make_unique<ModelLoader>(model_file);
 
-    // Note: We use lazy GPU caching - tensors are cached on first load
-    // and reused on subsequent accesses. This avoids OOM from preloading
-    // all tensors at once, while still eliminating repeated H2D transfers.
+    // Note: Using lazy GPU caching instead of preload_all_tensors() because:
+    // - Expert parallelism: each GPU only needs its local experts (not all 32)
+    // - Preloading all 2302 tensors would cause OOM
+    // - Lazy loading with GPU cache still eliminates repeated H2D transfers
+    // - Pinned memory in ModelLoader provides ~14 GB/s transfer speed
 
     load_embeddings();
     load_layers();

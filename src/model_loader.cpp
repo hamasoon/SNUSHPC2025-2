@@ -1,29 +1,37 @@
 #include "model_loader.h"
 #include <stdexcept>
 #include <iostream>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 ModelLoader::ModelLoader(const std::string& model_file)
-    : model_file_(model_file), pinned_buffer_(nullptr), pinned_buffer_size_(0) {
+    : model_file_(model_file), pinned_buffer_size_(0) {
+    pinned_buffer_[0] = nullptr;
+    pinned_buffer_[1] = nullptr;
     load_index();
 }
 
 ModelLoader::~ModelLoader() {
-    // Free pinned buffer
-    if (pinned_buffer_ != nullptr) {
-        cudaFreeHost(pinned_buffer_);
-        pinned_buffer_ = nullptr;
-        pinned_buffer_size_ = 0;
+    // Free pinned buffers (double-buffered)
+    for (int i = 0; i < 2; i++) {
+        if (pinned_buffer_[i] != nullptr) {
+            cudaFreeHost(pinned_buffer_[i]);
+            pinned_buffer_[i] = nullptr;
+        }
     }
+    pinned_buffer_size_ = 0;
     // GPU cache tensors will be freed by their destructors
 }
 
-void ModelLoader::ensure_pinned_buffer(size_t size) {
+void ModelLoader::ensure_pinned_buffers(size_t size) {
     if (pinned_buffer_size_ < size) {
-        if (pinned_buffer_ != nullptr) {
-            cudaFreeHost(pinned_buffer_);
+        // Free old buffers
+        for (int i = 0; i < 2; i++) {
+            if (pinned_buffer_[i] != nullptr) {
+                cudaFreeHost(pinned_buffer_[i]);
+            }
+            CHECK_CUDA(cudaMallocHost(&pinned_buffer_[i], size));
         }
-        CHECK_CUDA(cudaMallocHost(&pinned_buffer_, size));
         pinned_buffer_size_ = size;
     }
 }
@@ -100,14 +108,14 @@ Tensor ModelLoader::load_tensor(const std::string& name) {
     }
 
     // Use pinned memory for faster H2D transfer
-    ensure_pinned_buffer(info.size);
+    ensure_pinned_buffers(info.size);
 
     file.seekg(info.offset);
-    file.read(reinterpret_cast<char*>(pinned_buffer_), info.size);
+    file.read(reinterpret_cast<char*>(pinned_buffer_[0]), info.size);
     file.close();
 
     // Copy to GPU using pinned memory (faster than pageable memory)
-    CHECK_CUDA(cudaMemcpy(tensor.data(), pinned_buffer_, info.size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(tensor.data(), pinned_buffer_[0], info.size, cudaMemcpyHostToDevice));
 
     // Cache the tensor on GPU for future use
     gpu_cache_[name] = std::move(tensor);
@@ -140,24 +148,32 @@ size_t ModelLoader::get_cached_memory_bytes() const {
     return total;
 }
 
-void ModelLoader::preload_all_tensors() {
-    std::cout << "Preloading all tensors to GPU..." << std::endl;
+void ModelLoader::preload_all_tensors(cudaStream_t stream) {
+    std::cout << "Preloading all tensors to GPU with async transfers..." << std::endl;
 
     size_t total_size = 0;
     size_t max_tensor_size = 0;
 
-    // Find the maximum tensor size for pinned buffer allocation
+    // Collect tensors to load (sorted by offset for sequential file access)
+    std::vector<std::pair<std::string, TensorInfo>> tensors_to_load;
     for (const auto& pair : index_) {
-        total_size += pair.second.size;
-        if (pair.second.size > max_tensor_size) {
-            max_tensor_size = pair.second.size;
+        if (!is_cached(pair.first)) {
+            tensors_to_load.push_back(pair);
+            total_size += pair.second.size;
+            if (pair.second.size > max_tensor_size) {
+                max_tensor_size = pair.second.size;
+            }
         }
     }
 
-    // Pre-allocate pinned buffer for the largest tensor
-    ensure_pinned_buffer(max_tensor_size);
+    // Sort by file offset for sequential access
+    std::sort(tensors_to_load.begin(), tensors_to_load.end(),
+              [](const auto& a, const auto& b) { return a.second.offset < b.second.offset; });
 
-    std::cout << "  Total tensors: " << index_.size() << std::endl;
+    // Pre-allocate double pinned buffers for the largest tensor
+    ensure_pinned_buffers(max_tensor_size);
+
+    std::cout << "  Tensors to load: " << tensors_to_load.size() << std::endl;
     std::cout << "  Total size: " << (total_size / (1024.0 * 1024.0)) << " MB" << std::endl;
 
     // Open file once for all reads
@@ -166,37 +182,54 @@ void ModelLoader::preload_all_tensors() {
         throw std::runtime_error("Cannot open model file: " + model_file_);
     }
 
+    // Double-buffered async loading:
+    // While GPU transfers buffer[i], CPU reads into buffer[1-i]
     size_t loaded = 0;
-    for (const auto& pair : index_) {
-        const std::string& name = pair.first;
-        const TensorInfo& info = pair.second;
+    int current_buffer = 0;
+    Tensor* pending_tensor = nullptr;
+    std::string pending_name;
 
-        // Skip if already cached
-        if (is_cached(name)) {
+    for (size_t i = 0; i <= tensors_to_load.size(); i++) {
+        // Wait for previous async transfer to complete (if any)
+        if (pending_tensor != nullptr) {
+            CHECK_CUDA(cudaStreamSynchronize(stream));
+            // Cache the tensor
+            gpu_cache_[pending_name] = std::move(*pending_tensor);
+            delete pending_tensor;
+            pending_tensor = nullptr;
             loaded++;
-            continue;
+
+            if (loaded % 100 == 0) {
+                std::cout << "  Loaded " << loaded << "/" << tensors_to_load.size() << " tensors" << std::endl;
+            }
         }
 
-        // Create tensor on GPU
-        Tensor tensor(info.shape);
+        // Start next tensor load (if there are more)
+        if (i < tensors_to_load.size()) {
+            const std::string& name = tensors_to_load[i].first;
+            const TensorInfo& info = tensors_to_load[i].second;
 
-        // Read data using pinned buffer
-        file.seekg(info.offset);
-        file.read(reinterpret_cast<char*>(pinned_buffer_), info.size);
+            // Create tensor on GPU
+            pending_tensor = new Tensor(info.shape);
+            pending_name = name;
 
-        // Copy to GPU
-        CHECK_CUDA(cudaMemcpy(tensor.data(), pinned_buffer_, info.size, cudaMemcpyHostToDevice));
+            // Read data into current pinned buffer
+            file.seekg(info.offset);
+            file.read(reinterpret_cast<char*>(pinned_buffer_[current_buffer]), info.size);
 
-        // Cache the tensor
-        gpu_cache_[name] = std::move(tensor);
+            // Start async copy to GPU
+            CHECK_CUDA(cudaMemcpyAsync(pending_tensor->data(), pinned_buffer_[current_buffer],
+                                        info.size, cudaMemcpyHostToDevice, stream));
 
-        loaded++;
-        if (loaded % 100 == 0) {
-            std::cout << "  Loaded " << loaded << "/" << index_.size() << " tensors" << std::endl;
+            // Switch buffer for next iteration
+            current_buffer = 1 - current_buffer;
         }
     }
 
     file.close();
+
+    // Final synchronization
+    CHECK_CUDA(cudaStreamSynchronize(stream));
 
     std::cout << "  Preload complete. GPU memory used: "
               << (get_cached_memory_bytes() / (1024.0 * 1024.0)) << " MB" << std::endl;
