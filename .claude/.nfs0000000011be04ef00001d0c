@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make clean:*)",
+      "Bash(make:*)",
+      "Bash(./run.sh:*)",
+      "Bash(NODES=1 ./run.sh:*)",
+      "Bash(salloc:*)",
+      "Bash(NODES=2 ./run.sh:*)",
+      "Bash(NODES=3 ./run.sh:*)",
+      "Bash(srun:*)",
+      "Bash(cat:*)",
+      "Bash(wc:*)",
+      "Bash(NODES=4 ./run.sh:*)",
+      "Bash(sinfo:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(sqlite3:*)",
+      "Bash(python3:*)",
+      "Bash(ls:*)",
+      "Bash(SAMPLES=1 ./run.sh:*)",
+      "Bash(NODES=1 SAMPLES=1 ./run.sh:*)",
+      "Bash(NODES=4 SAMPLES=1 ./run.sh:*)",
+      "Bash(NODES=4 SAMPLES=64 ./run.sh:*)",
+      "Bash(NODES=4 SAMPLES=8 ./run.sh:*)",
+      "Bash(NODES=1 SAMPLES=8 ./run.sh:*)",
+      "Bash(mpirun:*)",
+      "Bash(nsys profile:*)",
+      "Bash(nsys export:*)",
+      "Bash(NODES=1 SAMPLES=8 nsys profile:*)",
+      "Bash(NODES=4 SAMPLES=128 ./run.sh:*)",
+      "Bash(NODES=4 SAMPLES=256 ./run.sh:*)",
+      "Bash(NODES=4 SAMPLES=1024 ./run.sh:*)",
+      "Bash(NODES=1 ./run_profile.sh:*)",
+      "Bash(NODES=1 SAMPLES=64 ./run.sh:*)",
+      "Bash(NODES=1 SAMPLES=16 ./run.sh:*)"
+    ]
+  }
+}

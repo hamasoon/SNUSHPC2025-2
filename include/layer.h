@@ -39,7 +39,7 @@ private:
     Tensor w2_;  // down projection
 };
 
-// Sparse MoE Block with Expert Parallelism
+// Sparse MoE Block with Expert Parallelism and Grouped GEMM
 class SparseMoeBlock {
 public:
     SparseMoeBlock(int layer_idx);
@@ -47,9 +47,15 @@ public:
 
 private:
     Tensor gate_;  // router (replicated on all GPUs)
-    std::vector<MLP> local_experts_;  // Only local experts for this GPU
     Tensor expert_bias_;  // optional (replicated)
     int layer_idx_;
+
+    // Stacked expert weights for grouped GEMM
+    // All local expert weights combined into single tensors
+    // Shape: [NUM_EXPERTS_PER_GPU, out_dim, in_dim]
+    Tensor stacked_w1_;  // [num_local_experts, intermediate_size, hidden_size]
+    Tensor stacked_w2_;  // [num_local_experts, hidden_size, intermediate_size]
+    Tensor stacked_w3_;  // [num_local_experts, intermediate_size, hidden_size]
 
     // Maps local expert index to global expert index
     std::vector<int> local_to_global_expert_;
@@ -71,9 +77,17 @@ private:
     int* d_sorted_indices_;      // Token indices sorted by expert
     float* d_sorted_weights_;    // Weights sorted by expert
 
+    // Intermediate buffers for fused expert computation
+    float* d_expert_input_;      // Gathered input for all experts
+    float* d_expert_output_;     // Output from all experts
+    float* d_gate_buf_;          // Intermediate: gate projection output
+    float* d_up_buf_;            // Intermediate: up projection output
+    size_t expert_buffer_size_;  // Current buffer capacity (max total tokens)
+
     void route_tokens_gpu(const Tensor& router_logits, size_t num_tokens);
     void ensure_routing_buffers(size_t num_tokens);
     void ensure_gather_scatter_buffers(size_t max_tokens_per_expert);
+    void ensure_expert_buffers(size_t total_tokens);
 };
 
 // Multi-Head Attention

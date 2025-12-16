@@ -532,6 +532,206 @@ __global__ void build_expert_indices_kernel(const int* top_k_indices, const floa
 }
 
 // ============================================================================
+// Grouped Expert GEMM Kernels
+// ============================================================================
+
+// Tile sizes for grouped expert GEMM
+#define EXPERT_BM 64
+#define EXPERT_BN 64
+#define EXPERT_BK 8
+#define EXPERT_TM 4
+#define EXPERT_TN 4
+
+// Grouped gather kernel: gather all tokens for all experts in one kernel
+// input: [num_tokens, hidden_size]
+// output: [total_expert_tokens, hidden_size] (tokens sorted by expert)
+// sorted_indices: [total_expert_tokens] (maps output position to input token)
+__global__ void grouped_gather_kernel(const float* __restrict__ input,
+                                       float* __restrict__ output,
+                                       const int* __restrict__ sorted_indices,
+                                       size_t total_tokens,
+                                       size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = total_tokens * hidden_size;
+
+    if (idx < total) {
+        size_t out_token = idx / hidden_size;
+        size_t dim = idx % hidden_size;
+        int in_token = sorted_indices[out_token];
+        output[idx] = input[in_token * hidden_size + dim];
+    }
+}
+
+// Grouped scatter-accumulate kernel: scatter all expert outputs back
+// expert_output: [total_expert_tokens, hidden_size]
+// output: [num_tokens, hidden_size]
+// sorted_indices: maps expert_output position to output token
+// sorted_weights: routing weights for each expert_output
+__global__ void grouped_scatter_accumulate_kernel(float* __restrict__ output,
+                                                   const float* __restrict__ expert_output,
+                                                   const int* __restrict__ sorted_indices,
+                                                   const float* __restrict__ sorted_weights,
+                                                   size_t total_tokens,
+                                                   size_t hidden_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = total_tokens * hidden_size;
+
+    if (idx < total) {
+        size_t token_idx = idx / hidden_size;
+        size_t dim = idx % hidden_size;
+        int out_token = sorted_indices[token_idx];
+        float weight = sorted_weights[token_idx];
+        atomicAdd(&output[out_token * hidden_size + dim], weight * expert_output[idx]);
+    }
+}
+
+// Grouped expert GEMM kernel for gate/up projections
+// Processes all local experts in parallel using 3D grid
+// input: [total_tokens, hidden_size] - tokens sorted by expert
+// weight: [num_experts, out_features, in_features] - stacked expert weights
+// output: [total_tokens, out_features]
+// expert_offsets: [num_experts+1] - start position of each expert's tokens
+__global__ void grouped_expert_gemm_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    const int* __restrict__ expert_offsets,
+    int num_experts,
+    int in_features,
+    int out_features) {
+
+    // blockIdx.z = expert_id
+    int expert_id = blockIdx.z;
+    if (expert_id >= num_experts) return;
+
+    int token_start = expert_offsets[expert_id];
+    int token_end = expert_offsets[expert_id + 1];
+    int num_tokens = token_end - token_start;
+    if (num_tokens == 0) return;
+
+    // Thread block tile position
+    int block_row = blockIdx.y * EXPERT_BM;  // Row in output (token dimension)
+    int block_col = blockIdx.x * EXPERT_BN;  // Column in output (out_features dimension)
+
+    // Skip if this block is outside the token range for this expert
+    if (block_row >= num_tokens) return;
+
+    // Thread position within block
+    int tx = threadIdx.x;  // 0-15
+    int ty = threadIdx.y;  // 0-15
+    int thread_row = ty * EXPERT_TM;
+    int thread_col = tx * EXPERT_TN;
+
+    // Pointers to this expert's data
+    const float* expert_input = input + token_start * in_features;
+    const float* expert_weight = weight + expert_id * out_features * in_features;
+    float* expert_output = output + token_start * out_features;
+
+    // Shared memory for tiling
+    __shared__ float As[EXPERT_BK][EXPERT_BM];  // Input tile (transposed for coalescing)
+    __shared__ float Bs[EXPERT_BK][EXPERT_BN];  // Weight tile
+
+    // Register accumulation
+    float reg_c[EXPERT_TM][EXPERT_TN] = {0.0f};
+    float reg_a[EXPERT_TM];
+    float reg_b[EXPERT_TN];
+
+    int num_threads = (EXPERT_BM / EXPERT_TM) * (EXPERT_BN / EXPERT_TN);  // 256
+    int tid = ty * (EXPERT_BN / EXPERT_TN) + tx;
+
+    int num_k_tiles = (in_features + EXPERT_BK - 1) / EXPERT_BK;
+
+    for (int tile = 0; tile < num_k_tiles; tile++) {
+        // Load input tile (A): [BM, BK] from input[block_row:, tile*BK:]
+        // Transposed storage: As[k][m]
+        int a_elements = EXPERT_BM * EXPERT_BK;
+        for (int i = tid; i < a_elements; i += num_threads) {
+            int m = i / EXPERT_BK;
+            int k = i % EXPERT_BK;
+            int global_m = block_row + m;
+            int global_k = tile * EXPERT_BK + k;
+            if (global_m < num_tokens && global_k < in_features) {
+                As[k][m] = expert_input[global_m * in_features + global_k];
+            } else {
+                As[k][m] = 0.0f;
+            }
+        }
+
+        // Load weight tile (B): [BK, BN] from weight[tile*BK:, block_col:]
+        // weight is [out_features, in_features], we want weight^T @ input^T
+        // Actually we compute input @ weight^T, so we load weight[block_col:, tile*BK:]
+        int b_elements = EXPERT_BK * EXPERT_BN;
+        for (int i = tid; i < b_elements; i += num_threads) {
+            int k = i / EXPERT_BN;
+            int n = i % EXPERT_BN;
+            int global_k = tile * EXPERT_BK + k;
+            int global_n = block_col + n;
+            if (global_k < in_features && global_n < out_features) {
+                // weight[global_n, global_k] for transposed access
+                Bs[k][n] = expert_weight[global_n * in_features + global_k];
+            } else {
+                Bs[k][n] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // Compute partial results
+        #pragma unroll
+        for (int kk = 0; kk < EXPERT_BK; kk++) {
+            #pragma unroll
+            for (int i = 0; i < EXPERT_TM; i++) {
+                reg_a[i] = As[kk][thread_row + i];
+            }
+            #pragma unroll
+            for (int j = 0; j < EXPERT_TN; j++) {
+                reg_b[j] = Bs[kk][thread_col + j];
+            }
+            #pragma unroll
+            for (int i = 0; i < EXPERT_TM; i++) {
+                #pragma unroll
+                for (int j = 0; j < EXPERT_TN; j++) {
+                    reg_c[i][j] += reg_a[i] * reg_b[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write results
+    #pragma unroll
+    for (int i = 0; i < EXPERT_TM; i++) {
+        int global_m = block_row + thread_row + i;
+        if (global_m < num_tokens) {
+            #pragma unroll
+            for (int j = 0; j < EXPERT_TN; j++) {
+                int global_n = block_col + thread_col + j;
+                if (global_n < out_features) {
+                    expert_output[global_m * out_features + global_n] = reg_c[i][j];
+                }
+            }
+        }
+    }
+}
+
+// Fused SiLU + Mul kernel for grouped experts
+// gate: [total_tokens, intermediate_size]
+// up: [total_tokens, intermediate_size]
+// output: [total_tokens, intermediate_size]
+__global__ void grouped_silu_mul_kernel(const float* __restrict__ gate,
+                                         const float* __restrict__ up,
+                                         float* __restrict__ output,
+                                         size_t total_elements) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        float g = gate[idx];
+        float silu_g = g / (1.0f + expf(-g));
+        output[idx] = silu_g * up[idx];
+    }
+}
+
+// ============================================================================
 // MLP Implementation
 // ============================================================================
 
@@ -570,14 +770,16 @@ void MLP::forward(const Tensor& x, Tensor& y) {
 }
 
 // ============================================================================
-// SparseMoeBlock Implementation with Expert Parallelism
+// SparseMoeBlock Implementation with Grouped Expert GEMM
 // ============================================================================
 
 SparseMoeBlock::SparseMoeBlock(int layer_idx)
     : layer_idx_(layer_idx), d_top_k_indices_(nullptr), d_top_k_weights_(nullptr), routing_buffer_size_(0),
       d_gather_indices_(nullptr), d_scatter_weights_(nullptr), gather_scatter_buffer_size_(0),
       d_expert_counts_(nullptr), d_expert_offsets_(nullptr), d_expert_write_pos_(nullptr),
-      d_sorted_indices_(nullptr), d_sorted_weights_(nullptr) {
+      d_sorted_indices_(nullptr), d_sorted_weights_(nullptr),
+      d_expert_input_(nullptr), d_expert_output_(nullptr), d_gate_buf_(nullptr), d_up_buf_(nullptr),
+      expert_buffer_size_(0) {
     std::stringstream ss;
     ss << "layers." << layer_idx << ".feed_forward.gate.weight";
     gate_ = Tensor::load_from_file(ss.str());
@@ -586,17 +788,42 @@ SparseMoeBlock::SparseMoeBlock(int layer_idx)
     int expert_start = g_parallel_ctx.expert_start;
     int expert_end = g_parallel_ctx.expert_end;
 
-    local_experts_.reserve(NUM_EXPERTS_PER_GPU);
     local_to_global_expert_.reserve(NUM_EXPERTS_PER_GPU);
 
+    // Load and stack expert weights for grouped GEMM
+    // Shape: [NUM_EXPERTS_PER_GPU, out_dim, in_dim]
+    stacked_w1_ = Tensor({NUM_EXPERTS_PER_GPU, MOE_INTERMEDIATE_SIZE, HIDDEN_SIZE});
+    stacked_w2_ = Tensor({NUM_EXPERTS_PER_GPU, HIDDEN_SIZE, MOE_INTERMEDIATE_SIZE});
+    stacked_w3_ = Tensor({NUM_EXPERTS_PER_GPU, MOE_INTERMEDIATE_SIZE, HIDDEN_SIZE});
+
     for (int e = expert_start; e < expert_end; e++) {
+        int local_idx = e - expert_start;
+        local_to_global_expert_.push_back(e);
+
         std::stringstream ss_w1, ss_w2, ss_w3;
         ss_w1 << "layers." << layer_idx << ".feed_forward.experts." << e << ".w1.weight";
         ss_w2 << "layers." << layer_idx << ".feed_forward.experts." << e << ".w2.weight";
         ss_w3 << "layers." << layer_idx << ".feed_forward.experts." << e << ".w3.weight";
 
-        local_experts_.emplace_back(ss_w1.str(), ss_w2.str(), ss_w3.str());
-        local_to_global_expert_.push_back(e);
+        // Load individual expert weights
+        Tensor w1 = Tensor::load_from_file(ss_w1.str());
+        Tensor w2 = Tensor::load_from_file(ss_w2.str());
+        Tensor w3 = Tensor::load_from_file(ss_w3.str());
+
+        // Copy to stacked tensor at the correct offset
+        size_t w1_offset = local_idx * MOE_INTERMEDIATE_SIZE * HIDDEN_SIZE;
+        size_t w2_offset = local_idx * HIDDEN_SIZE * MOE_INTERMEDIATE_SIZE;
+        size_t w3_offset = local_idx * MOE_INTERMEDIATE_SIZE * HIDDEN_SIZE;
+
+        CHECK_CUDA(cudaMemcpy(stacked_w1_.data() + w1_offset, w1.data(),
+                              MOE_INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float),
+                              cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaMemcpy(stacked_w2_.data() + w2_offset, w2.data(),
+                              HIDDEN_SIZE * MOE_INTERMEDIATE_SIZE * sizeof(float),
+                              cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaMemcpy(stacked_w3_.data() + w3_offset, w3.data(),
+                              MOE_INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float),
+                              cudaMemcpyDeviceToDevice));
     }
 
     if (USE_EXPERT_BIAS) {
@@ -606,9 +833,9 @@ SparseMoeBlock::SparseMoeBlock(int layer_idx)
     }
 
     // Pre-allocate routing buffers for typical batch size
-    // Will be resized if needed
-    ensure_routing_buffers(64);  // Initial size for 64 tokens
-    ensure_gather_scatter_buffers(64);  // Initial size for gather/scatter
+    ensure_routing_buffers(64);
+    ensure_gather_scatter_buffers(64);
+    ensure_expert_buffers(256);  // Initial size for intermediate buffers
 }
 
 void SparseMoeBlock::ensure_routing_buffers(size_t num_tokens) {
@@ -655,6 +882,24 @@ void SparseMoeBlock::ensure_gather_scatter_buffers(size_t max_tokens_per_expert)
     CHECK_CUDA(cudaMalloc(&d_gather_indices_, new_size * sizeof(int)));
     CHECK_CUDA(cudaMalloc(&d_scatter_weights_, new_size * sizeof(float)));
     gather_scatter_buffer_size_ = new_size;
+}
+
+void SparseMoeBlock::ensure_expert_buffers(size_t total_tokens) {
+    if (total_tokens <= expert_buffer_size_) return;
+
+    // Free old buffers if they exist
+    if (d_expert_input_ != nullptr) cudaFree(d_expert_input_);
+    if (d_expert_output_ != nullptr) cudaFree(d_expert_output_);
+    if (d_gate_buf_ != nullptr) cudaFree(d_gate_buf_);
+    if (d_up_buf_ != nullptr) cudaFree(d_up_buf_);
+
+    // Allocate new buffers with some headroom
+    size_t new_size = total_tokens * 2;
+    CHECK_CUDA(cudaMalloc(&d_expert_input_, new_size * HIDDEN_SIZE * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_expert_output_, new_size * HIDDEN_SIZE * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_gate_buf_, new_size * MOE_INTERMEDIATE_SIZE * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_up_buf_, new_size * MOE_INTERMEDIATE_SIZE * sizeof(float)));
+    expert_buffer_size_ = new_size;
 }
 
 void SparseMoeBlock::route_tokens_gpu(const Tensor& router_logits, size_t num_tokens) {
@@ -706,16 +951,23 @@ void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) 
     y = Tensor({batch, seq_len, hidden_size});
     y.zero();
 
-    // Copy expert counts to host for iteration (small transfer: NUM_EXPERTS_PER_GPU ints)
+    // Copy expert counts to host (small transfer: NUM_EXPERTS_PER_GPU ints)
     int h_expert_counts[NUM_EXPERTS_PER_GPU];
     int h_expert_offsets[NUM_EXPERTS_PER_GPU + 1];
     CHECK_CUDA(cudaMemcpy(h_expert_counts, d_expert_counts_,
                           NUM_EXPERTS_PER_GPU * sizeof(int), cudaMemcpyDeviceToHost));
 
-    // Compute prefix sums (offsets) on host - this is fast for 8 values
+    // Compute prefix sums (offsets) on host
     h_expert_offsets[0] = 0;
+    int total_expert_tokens = 0;
     for (int i = 0; i < NUM_EXPERTS_PER_GPU; i++) {
         h_expert_offsets[i + 1] = h_expert_offsets[i] + h_expert_counts[i];
+        total_expert_tokens += h_expert_counts[i];
+    }
+
+    // Skip if no tokens routed to this GPU's experts
+    if (total_expert_tokens == 0) {
+        goto allreduce;
     }
 
     // Copy offsets to GPU
@@ -726,48 +978,121 @@ void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) 
     CHECK_CUDA(cudaMemset(d_expert_write_pos_, 0, NUM_EXPERTS_PER_GPU * sizeof(int)));
 
     // Build sorted indices on GPU
-    int build_blocks = (num_tokens * NUM_EXPERTS_PER_TOK + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    build_expert_indices_kernel<<<build_blocks, BLOCK_SIZE>>>(
-        d_top_k_indices_, d_top_k_weights_,
-        d_sorted_indices_, d_sorted_weights_,
-        d_expert_write_pos_, d_expert_offsets_,
-        num_tokens, NUM_EXPERTS_PER_TOK,
-        g_parallel_ctx.expert_start, NUM_EXPERTS_PER_GPU);
-    CHECK_CUDA(cudaGetLastError());
-
-    // Process local experts with batched tokens - all indices already on GPU
-    for (int local_e = 0; local_e < NUM_EXPERTS_PER_GPU; local_e++) {
-        int batch_size = h_expert_counts[local_e];
-        if (batch_size == 0) continue;
-
-        int offset = h_expert_offsets[local_e];
-
-        // Gather all tokens for this expert using batched kernel
-        // Token indices and weights are already at d_sorted_indices_ + offset
-        Tensor batched_input({(size_t)batch_size, 1, hidden_size});
-        int gather_blocks = (batch_size * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        batched_gather_kernel<<<gather_blocks, BLOCK_SIZE>>>(
-            x_flat.data(), batched_input.data(), d_sorted_indices_ + offset,
-            batch_size, hidden_size);
-        CHECK_CUDA(cudaGetLastError());
-
-        // Process entire batch through expert at once
-        Tensor batched_output({(size_t)batch_size, 1, hidden_size});
-        local_experts_[local_e].forward(batched_input, batched_output);
-
-        // Scatter weighted outputs back to y using batched kernel
-        int scatter_blocks = (batch_size * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        batched_scatter_accumulate_kernel<<<scatter_blocks, BLOCK_SIZE>>>(
-            y.data(), batched_output.data(), d_sorted_indices_ + offset,
-            d_sorted_weights_ + offset, batch_size, hidden_size);
+    {
+        int build_blocks = (num_tokens * NUM_EXPERTS_PER_TOK + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        build_expert_indices_kernel<<<build_blocks, BLOCK_SIZE>>>(
+            d_top_k_indices_, d_top_k_weights_,
+            d_sorted_indices_, d_sorted_weights_,
+            d_expert_write_pos_, d_expert_offsets_,
+            num_tokens, NUM_EXPERTS_PER_TOK,
+            g_parallel_ctx.expert_start, NUM_EXPERTS_PER_GPU);
         CHECK_CUDA(cudaGetLastError());
     }
 
-    // Synchronize and reduce across GPUs within the node
-    // Use async D2H transfer
-    y.sync_to_host_async(g_parallel_ctx.d2h_stream);
+    // Ensure intermediate buffers are large enough
+    ensure_expert_buffers(total_expert_tokens);
 
-    // Wait for D2H transfer to complete before MPI
+    // ========================================================================
+    // Grouped Expert GEMM: Process ALL experts in parallel
+    // ========================================================================
+
+    // Step 1: Gather all tokens for all experts (single kernel)
+    {
+        int gather_blocks = (total_expert_tokens * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        grouped_gather_kernel<<<gather_blocks, BLOCK_SIZE>>>(
+            x_flat.data(), d_expert_input_, d_sorted_indices_,
+            total_expert_tokens, hidden_size);
+        CHECK_CUDA(cudaGetLastError());
+    }
+
+    // Step 2: Gate projection for all experts (grouped GEMM)
+    // input @ w1^T: [total_tokens, hidden] @ [experts, intermediate, hidden]^T
+    {
+        // Find max tokens per expert for grid sizing
+        int max_tokens = 0;
+        for (int i = 0; i < NUM_EXPERTS_PER_GPU; i++) {
+            if (h_expert_counts[i] > max_tokens) max_tokens = h_expert_counts[i];
+        }
+
+        dim3 block(EXPERT_BN / EXPERT_TN, EXPERT_BM / EXPERT_TM);  // 16x16 = 256 threads
+        dim3 grid(
+            (MOE_INTERMEDIATE_SIZE + EXPERT_BN - 1) / EXPERT_BN,
+            (max_tokens + EXPERT_BM - 1) / EXPERT_BM,
+            NUM_EXPERTS_PER_GPU
+        );
+
+        grouped_expert_gemm_kernel<<<grid, block>>>(
+            d_expert_input_, stacked_w1_.data(), d_gate_buf_,
+            d_expert_offsets_, NUM_EXPERTS_PER_GPU,
+            HIDDEN_SIZE, MOE_INTERMEDIATE_SIZE);
+        CHECK_CUDA(cudaGetLastError());
+    }
+
+    // Step 3: Up projection for all experts (grouped GEMM)
+    // input @ w3^T
+    {
+        int max_tokens = 0;
+        for (int i = 0; i < NUM_EXPERTS_PER_GPU; i++) {
+            if (h_expert_counts[i] > max_tokens) max_tokens = h_expert_counts[i];
+        }
+
+        dim3 block(EXPERT_BN / EXPERT_TN, EXPERT_BM / EXPERT_TM);
+        dim3 grid(
+            (MOE_INTERMEDIATE_SIZE + EXPERT_BN - 1) / EXPERT_BN,
+            (max_tokens + EXPERT_BM - 1) / EXPERT_BM,
+            NUM_EXPERTS_PER_GPU
+        );
+
+        grouped_expert_gemm_kernel<<<grid, block>>>(
+            d_expert_input_, stacked_w3_.data(), d_up_buf_,
+            d_expert_offsets_, NUM_EXPERTS_PER_GPU,
+            HIDDEN_SIZE, MOE_INTERMEDIATE_SIZE);
+        CHECK_CUDA(cudaGetLastError());
+    }
+
+    // Step 4: Fused SiLU + Mul (single kernel for all tokens)
+    {
+        size_t total_elements = total_expert_tokens * MOE_INTERMEDIATE_SIZE;
+        int silu_blocks = (total_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        grouped_silu_mul_kernel<<<silu_blocks, BLOCK_SIZE>>>(
+            d_gate_buf_, d_up_buf_, d_gate_buf_, total_elements);
+        CHECK_CUDA(cudaGetLastError());
+    }
+
+    // Step 5: Down projection for all experts (grouped GEMM)
+    // hidden @ w2^T: [total_tokens, intermediate] @ [experts, hidden, intermediate]^T
+    {
+        int max_tokens = 0;
+        for (int i = 0; i < NUM_EXPERTS_PER_GPU; i++) {
+            if (h_expert_counts[i] > max_tokens) max_tokens = h_expert_counts[i];
+        }
+
+        dim3 block(EXPERT_BN / EXPERT_TN, EXPERT_BM / EXPERT_TM);
+        dim3 grid(
+            (HIDDEN_SIZE + EXPERT_BN - 1) / EXPERT_BN,
+            (max_tokens + EXPERT_BM - 1) / EXPERT_BM,
+            NUM_EXPERTS_PER_GPU
+        );
+
+        grouped_expert_gemm_kernel<<<grid, block>>>(
+            d_gate_buf_, stacked_w2_.data(), d_expert_output_,
+            d_expert_offsets_, NUM_EXPERTS_PER_GPU,
+            MOE_INTERMEDIATE_SIZE, HIDDEN_SIZE);
+        CHECK_CUDA(cudaGetLastError());
+    }
+
+    // Step 6: Scatter weighted outputs back to y (single kernel)
+    {
+        int scatter_blocks = (total_expert_tokens * hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        grouped_scatter_accumulate_kernel<<<scatter_blocks, BLOCK_SIZE>>>(
+            y.data(), d_expert_output_, d_sorted_indices_, d_sorted_weights_,
+            total_expert_tokens, hidden_size);
+        CHECK_CUDA(cudaGetLastError());
+    }
+
+allreduce:
+    // Synchronize and reduce across GPUs within the node
+    y.sync_to_host_async(g_parallel_ctx.d2h_stream);
     CHECK_CUDA(cudaStreamSynchronize(g_parallel_ctx.d2h_stream));
     y.mark_host_valid();
     float* y_host = y.host_data();
