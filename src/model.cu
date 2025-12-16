@@ -726,7 +726,8 @@ __global__ void grouped_silu_mul_kernel(const float* __restrict__ gate,
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total_elements) {
         float g = gate[idx];
-        float silu_g = g / (1.0f + expf(-g));
+        float inv_sigmoid = 1.0f / (1.0f + expf(-g));
+        float silu_g = g * inv_sigmoid;
         output[idx] = silu_g * up[idx];
     }
 }

@@ -85,7 +85,8 @@ __global__ void silu_mul_kernel(const float* gate, const float* up, float* y, si
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         float g = gate[idx];
-        float silu_g = g / (1.0f + expf(-g));
+        float inv_sigmoid = 1.0f / (1.0f + expf(-g));
+        float silu_g = g * inv_sigmoid;
         y[idx] = silu_g * up[idx];
     }
 }
