@@ -65,4 +65,7 @@ dkms.conf
 *.srec
 main
 *.nsys-rep
+*.ncu-rep
+nsight-compute-lock
 *.sqlite
+.claude/*
