@@ -652,7 +652,7 @@ void matmul_transposed_kernel(const float* __restrict__ a, const float* __restri
     }
 }
 
-// Fallback transposed kernel for small matrices
+// Fallback transposed kernel for very small matrices (k < BK=8)
 // __launch_bounds__ optimizes register allocation for 256 threads
 __global__ __launch_bounds__(256, 4)
 void matmul_transposed_kernel_simple(const float* a, const float* b, float* c,
@@ -856,12 +856,16 @@ void matmul_transposed(const Tensor& a, const Tensor& b, Tensor& c) {
     size_t k = a.size(1);
     size_t n = b.size(0);
 
-    // Use optimized kernel for large matrices, simple kernel for small ones
-    if (m >= BM && n >= BN && k >= BK) {
+    // Always use optimized kernel - it has proper boundary checks
+    // The kernel handles any m,k,n with boundary conditions
+    // Only fall back to simple kernel for very small k (< BK=8)
+    if (k >= BK) {
+        // Full optimized kernel: 16x16 threads, each computing 8x4 elements
         dim3 block(BN / TN, BM / TM);  // 16x16 = 256 threads
         dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
         matmul_transposed_kernel<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
     } else {
+        // Fallback to simple kernel only for very small k dimension
         dim3 block(TILE_SIZE, TILE_SIZE);
         dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE, (m + TILE_SIZE - 1) / TILE_SIZE);
         matmul_transposed_kernel_simple<<<grid, block>>>(a.data(), b.data(), c.data(), m, k, n);
