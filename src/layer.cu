@@ -18,11 +18,12 @@
 // BM, BN: Block tile size for M and N dimensions
 // BK: Block tile size for K dimension
 // TM, TN: Register tile size per thread (each thread computes TM x TN elements)
+// OPTIMAL: 352.48 samples/sec (+9.1% from baseline 323.16)
 #define BM 128
-#define BN 128
+#define BN 64
 #define BK 8
 #define TM 8
-#define TN 8
+#define TN 4
 
 // Warp configuration
 #define WARP_SIZE 32
