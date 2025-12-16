@@ -68,7 +68,7 @@ if [ $USE_NCU -eq 1 ]; then
 
     # Kernel filter
     if [ -n "$NCU_KERNEL" ]; then
-        NCU_CMD="$NCU_CMD --kernel-name-base demangled --kernel-name \"$NCU_KERNEL\""
+        NCU_CMD="$NCU_CMD -k \"$NCU_KERNEL\""
         echo "Filtering kernel: $NCU_KERNEL"
     fi
 

@@ -594,7 +594,9 @@ __global__ void grouped_scatter_accumulate_kernel(float* __restrict__ output,
 // weight: [num_experts, out_features, in_features] - stacked expert weights
 // output: [total_tokens, out_features]
 // expert_offsets: [num_experts+1] - start position of each expert's tokens
-__global__ void grouped_expert_gemm_kernel(
+// __launch_bounds__ reduces register pressure for better occupancy
+__global__ __launch_bounds__(256, 4)
+void grouped_expert_gemm_kernel(
     const float* __restrict__ input,
     const float* __restrict__ weight,
     float* __restrict__ output,

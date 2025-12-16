@@ -18,7 +18,6 @@
 // BM, BN: Block tile size for M and N dimensions
 // BK: Block tile size for K dimension
 // TM, TN: Register tile size per thread (each thread computes TM x TN elements)
-// OPTIMAL: 352.48 samples/sec (+9.1% from baseline 323.16)
 #define BM 128
 #define BN 64
 #define BK 8
@@ -465,8 +464,10 @@ __global__ void matmul_kernel_simple(const float* a, const float* b, float* c,
 // - Shared memory padding (+4) to avoid bank conflicts (32 banks, 4 bytes each)
 // - Vectorized float4 loads for 128-bit memory transactions
 // - Coalesced global memory access pattern for 128-byte cache lines
-__global__ void matmul_transposed_kernel(const float* __restrict__ a, const float* __restrict__ b,
-                                          float* __restrict__ c, size_t m, size_t k, size_t n) {
+// - __launch_bounds__ to optimize register allocation for better occupancy
+__global__ __launch_bounds__(256, 4)
+void matmul_transposed_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                              float* __restrict__ c, size_t m, size_t k, size_t n) {
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
 
@@ -652,8 +653,10 @@ __global__ void matmul_transposed_kernel(const float* __restrict__ a, const floa
 }
 
 // Fallback transposed kernel for small matrices
-__global__ void matmul_transposed_kernel_simple(const float* a, const float* b, float* c,
-                                                 size_t m, size_t k, size_t n) {
+// __launch_bounds__ optimizes register allocation for 256 threads
+__global__ __launch_bounds__(256, 4)
+void matmul_transposed_kernel_simple(const float* a, const float* b, float* c,
+                                     size_t m, size_t k, size_t n) {
     __shared__ float As[TILE_SIZE][TILE_SIZE];
     __shared__ float Bs[TILE_SIZE][TILE_SIZE];
 

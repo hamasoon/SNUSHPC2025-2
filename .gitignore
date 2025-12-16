@@ -69,3 +69,4 @@ main
 nsight-compute-lock
 *.sqlite
 .claude/*
+*.csv
