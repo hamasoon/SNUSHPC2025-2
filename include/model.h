@@ -45,6 +45,7 @@ extern ParallelContext g_parallel_ctx;
 class LFM2Model {
 public:
     LFM2Model(const std::string& model_file);
+    ~LFM2Model();
 
     // Forward pass (single sample)
     void forward(const std::vector<int>& input_ids, Tensor& logits);
@@ -53,25 +54,32 @@ public:
     // input_ids: flattened array of [batch_size * seq_len]
     // logits: output tensor of shape [batch_size, vocab_size]
     void forward_batch(const int* input_ids, size_t batch_size, size_t seq_len, Tensor& logits);
-    
+
 private:
     std::unique_ptr<ModelLoader> loader_;
-    
+
     // Embeddings
     Tensor embed_tokens_;
-    
+
     // Decoder layers
     std::vector<std::unique_ptr<DecoderLayer>> layers_;
-    
+
     // Final norm
     std::unique_ptr<RMSNorm> norm_;
-    
+
     // LM head (output projection)
     Tensor lm_head_;
-    
+
     // RoPE
     std::unique_ptr<RotaryEmbedding> rotary_emb_;
-    
+
+    // Pre-allocated buffers for input_ids (avoid repeated cudaMalloc/cudaFree)
+    int* d_input_ids_buffer_;
+    int* h_input_ids_buffer_;  // Pinned host buffer
+    size_t input_ids_buffer_size_;
+
+    void ensure_input_buffers(size_t size);
+
     // Helper functions
     void load_embeddings();
     void load_layers();

@@ -46,6 +46,34 @@ inline GPUMemoryPool& gpu_memory_pool() {
     return GPUMemoryPool::instance();
 }
 
+/**
+ * Pinned Host Memory Pool for reducing cudaMallocHost/cudaFreeHost overhead.
+ * Pinned memory enables faster H2D/D2H transfers and async operations.
+ * Uses size-bucketing strategy similar to GPUMemoryPool.
+ */
+class PinnedMemoryPool {
+public:
+    static PinnedMemoryPool& instance();
+    float* allocate(size_t num_elements);
+    void deallocate(float* ptr, size_t num_elements);
+    void clear();
+
+    PinnedMemoryPool(const PinnedMemoryPool&) = delete;
+    PinnedMemoryPool& operator=(const PinnedMemoryPool&) = delete;
+
+private:
+    PinnedMemoryPool();
+    ~PinnedMemoryPool();
+    size_t bucket_size(size_t num_elements) const;
+
+    std::unordered_map<size_t, std::vector<float*>> free_buffers_;
+    mutable std::mutex mutex_;
+};
+
+inline PinnedMemoryPool& pinned_memory_pool() {
+    return PinnedMemoryPool::instance();
+}
+
 // Forward declaration
 class ModelLoader;
 

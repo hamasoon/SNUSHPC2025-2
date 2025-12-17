@@ -85,6 +85,81 @@ void GPUMemoryPool::clear() {
     free_buffers_.clear();
 }
 
+// ============================================================================
+// Pinned Host Memory Pool Implementation
+// ============================================================================
+
+static constexpr size_t PINNED_MIN_BUCKET_SIZE = 256;  // 1 KB minimum
+
+PinnedMemoryPool& PinnedMemoryPool::instance() {
+    static PinnedMemoryPool pool;
+    return pool;
+}
+
+PinnedMemoryPool::PinnedMemoryPool() {}
+
+PinnedMemoryPool::~PinnedMemoryPool() {
+    clear();
+}
+
+size_t PinnedMemoryPool::bucket_size(size_t num_elements) const {
+    if (num_elements == 0) return 0;
+    if (num_elements < PINNED_MIN_BUCKET_SIZE) return PINNED_MIN_BUCKET_SIZE;
+
+    // Round up to next power of 2 for sizes up to 1M elements
+    if (num_elements <= 1024 * 1024) {
+        size_t bucket = PINNED_MIN_BUCKET_SIZE;
+        while (bucket < num_elements) bucket *= 2;
+        return bucket;
+    }
+    // For larger sizes, round up to nearest 1M elements
+    size_t million = 1024 * 1024;
+    return ((num_elements + million - 1) / million) * million;
+}
+
+float* PinnedMemoryPool::allocate(size_t num_elements) {
+    if (num_elements == 0) return nullptr;
+
+    size_t bucket = bucket_size(num_elements);
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = free_buffers_.find(bucket);
+    if (it != free_buffers_.end() && !it->second.empty()) {
+        float* ptr = it->second.back();
+        it->second.pop_back();
+        return ptr;
+    }
+
+    float* ptr = nullptr;
+    cudaError_t err = cudaMallocHost(&ptr, bucket * sizeof(float));
+    if (err != cudaSuccess) {
+        // Try to free pooled memory and retry
+        for (auto& pair : free_buffers_) {
+            for (float* buf : pair.second) cudaFreeHost(buf);
+            pair.second.clear();
+        }
+        err = cudaMallocHost(&ptr, bucket * sizeof(float));
+        if (err != cudaSuccess) return nullptr;
+    }
+    return ptr;
+}
+
+void PinnedMemoryPool::deallocate(float* ptr, size_t num_elements) {
+    if (ptr == nullptr || num_elements == 0) return;
+    size_t bucket = bucket_size(num_elements);
+    std::lock_guard<std::mutex> lock(mutex_);
+    free_buffers_[bucket].push_back(ptr);
+}
+
+void PinnedMemoryPool::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& pair : free_buffers_) {
+        for (float* ptr : pair.second) cudaFreeHost(ptr);
+        pair.second.clear();
+    }
+    free_buffers_.clear();
+}
+
 // Tensor class implementation with GPU support
 
 // Tensor constructors and destructors
@@ -111,8 +186,11 @@ Tensor::Tensor(const std::vector<size_t>& shape, float* data, bool copy, bool on
             host_valid_ = false;
         } else {
             // This shouldn't happen in our design, but handle it
-            // Use pinned memory for better transfer bandwidth
-            CHECK_CUDA(cudaMallocHost(&h_data_, size_ * sizeof(float)));
+            // Use pinned memory pool for better transfer bandwidth
+            h_data_ = pinned_memory_pool().allocate(size_);
+            if (h_data_ == nullptr) {
+                throw std::runtime_error("Pinned memory allocation failed");
+            }
             host_pinned_ = true;
             std::memcpy(h_data_, data, size_ * sizeof(float));
             CHECK_CUDA(cudaMemcpy(d_data_, data, size_ * sizeof(float), cudaMemcpyHostToDevice));
@@ -232,7 +310,8 @@ void Tensor::deallocate() {
         }
         if (h_data_ != nullptr) {
             if (host_pinned_) {
-                cudaFreeHost(h_data_);
+                // Return to pinned memory pool instead of cudaFreeHost
+                pinned_memory_pool().deallocate(h_data_, size_);
             } else {
                 delete[] h_data_;
             }
@@ -264,11 +343,14 @@ size_t Tensor::compute_stride(int dim) const {
 }
 
 // Ensure host data is allocated and valid
-// Uses pinned memory for faster H2D/D2H transfers (~14 GB/s vs ~12 GB/s)
+// Uses pinned memory pool for faster H2D/D2H transfers and reduced alloc overhead
 void Tensor::ensure_host_data() const {
     if (h_data_ == nullptr && size_ > 0) {
-        // Use pinned memory for better transfer bandwidth
-        CHECK_CUDA(cudaMallocHost(&h_data_, size_ * sizeof(float)));
+        // Use pinned memory pool instead of direct cudaMallocHost
+        h_data_ = pinned_memory_pool().allocate(size_);
+        if (h_data_ == nullptr) {
+            throw std::runtime_error("Pinned memory allocation failed");
+        }
         host_pinned_ = true;
     }
     if (!host_valid_ && device_valid_ && size_ > 0) {
@@ -304,8 +386,11 @@ void Tensor::sync_to_device() {
 // Async sync operations with CUDA streams
 void Tensor::sync_to_host_async(cudaStream_t stream) const {
     if (h_data_ == nullptr && size_ > 0) {
-        // Must use pinned memory for async transfers
-        CHECK_CUDA(cudaMallocHost(&h_data_, size_ * sizeof(float)));
+        // Use pinned memory pool for async transfers
+        h_data_ = pinned_memory_pool().allocate(size_);
+        if (h_data_ == nullptr) {
+            throw std::runtime_error("Pinned memory allocation failed");
+        }
         host_pinned_ = true;
     }
     if (!host_valid_ && device_valid_ && size_ > 0) {
@@ -494,9 +579,12 @@ Tensor Tensor::copy() const {
 
 void Tensor::fill(float value) {
     if (size_ > 0) {
-        // Allocate pinned host buffer if needed
+        // Allocate pinned host buffer from pool if needed
         if (h_data_ == nullptr) {
-            CHECK_CUDA(cudaMallocHost(&h_data_, size_ * sizeof(float)));
+            h_data_ = pinned_memory_pool().allocate(size_);
+            if (h_data_ == nullptr) {
+                throw std::runtime_error("Pinned memory allocation failed");
+            }
             host_pinned_ = true;
         }
         std::fill(h_data_, h_data_ + size_, value);

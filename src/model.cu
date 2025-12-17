@@ -858,7 +858,7 @@ SparseMoeBlock::SparseMoeBlock(int layer_idx)
       d_expert_counts_(nullptr), d_expert_offsets_(nullptr), d_expert_write_pos_(nullptr),
       d_sorted_indices_(nullptr), d_sorted_weights_(nullptr),
       d_expert_input_(nullptr), d_expert_output_(nullptr), d_gate_buf_(nullptr), d_up_buf_(nullptr),
-      expert_buffer_size_(0) {
+      expert_buffer_size_(0), h_allreduce_buffer_(nullptr), allreduce_buffer_size_(0) {
     std::stringstream ss;
     ss << "layers." << layer_idx << ".feed_forward.gate.weight";
     gate_ = Tensor::load_from_file(ss.str());
@@ -915,6 +915,24 @@ SparseMoeBlock::SparseMoeBlock(int layer_idx)
     ensure_routing_buffers(64);
     ensure_gather_scatter_buffers(64);
     ensure_expert_buffers(256);  // Initial size for intermediate buffers
+    ensure_allreduce_buffer(64 * HIDDEN_SIZE);  // Initial allreduce buffer
+}
+
+SparseMoeBlock::~SparseMoeBlock() {
+    if (d_top_k_indices_) cudaFree(d_top_k_indices_);
+    if (d_top_k_weights_) cudaFree(d_top_k_weights_);
+    if (d_gather_indices_) cudaFree(d_gather_indices_);
+    if (d_scatter_weights_) cudaFree(d_scatter_weights_);
+    if (d_expert_counts_) cudaFree(d_expert_counts_);
+    if (d_expert_offsets_) cudaFree(d_expert_offsets_);
+    if (d_expert_write_pos_) cudaFree(d_expert_write_pos_);
+    if (d_sorted_indices_) cudaFree(d_sorted_indices_);
+    if (d_sorted_weights_) cudaFree(d_sorted_weights_);
+    if (d_expert_input_) cudaFree(d_expert_input_);
+    if (d_expert_output_) cudaFree(d_expert_output_);
+    if (d_gate_buf_) cudaFree(d_gate_buf_);
+    if (d_up_buf_) cudaFree(d_up_buf_);
+    if (h_allreduce_buffer_) cudaFreeHost(h_allreduce_buffer_);
 }
 
 void SparseMoeBlock::ensure_routing_buffers(size_t num_tokens) {
@@ -979,6 +997,20 @@ void SparseMoeBlock::ensure_expert_buffers(size_t total_tokens) {
     CHECK_CUDA(cudaMalloc(&d_gate_buf_, new_size * MOE_INTERMEDIATE_SIZE * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_up_buf_, new_size * MOE_INTERMEDIATE_SIZE * sizeof(float)));
     expert_buffer_size_ = new_size;
+}
+
+void SparseMoeBlock::ensure_allreduce_buffer(size_t size) {
+    if (size <= allreduce_buffer_size_) return;
+
+    // Free old buffer if exists
+    if (h_allreduce_buffer_ != nullptr) {
+        cudaFreeHost(h_allreduce_buffer_);
+    }
+
+    // Allocate new pinned buffer with headroom
+    size_t new_size = size * 2;
+    CHECK_CUDA(cudaMallocHost(&h_allreduce_buffer_, new_size * sizeof(float)));
+    allreduce_buffer_size_ = new_size;
 }
 
 void SparseMoeBlock::route_tokens_gpu(const Tensor& router_logits, size_t num_tokens) {
@@ -1170,19 +1202,23 @@ void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits) 
     }
 
 allreduce:
-    // Synchronize and reduce across GPUs within the node
-    y.sync_to_host_async(g_parallel_ctx.d2h_stream);
+    // Ensure pre-allocated allreduce buffer is large enough
+    ensure_allreduce_buffer(num_tokens * hidden_size);
+
+    // Async D2H using pre-allocated pinned buffer (avoids cudaMallocHost in hot path)
+    CHECK_CUDA(cudaMemcpyAsync(h_allreduce_buffer_, y.data(),
+                                num_tokens * hidden_size * sizeof(float),
+                                cudaMemcpyDeviceToHost, g_parallel_ctx.d2h_stream));
     CHECK_CUDA(cudaStreamSynchronize(g_parallel_ctx.d2h_stream));
-    y.mark_host_valid();
-    float* y_host = y.host_data();
 
     // MPI_Allreduce within node to combine expert outputs
-    MPI_Allreduce(MPI_IN_PLACE, y_host, num_tokens * hidden_size,
+    MPI_Allreduce(MPI_IN_PLACE, h_allreduce_buffer_, num_tokens * hidden_size,
                   MPI_FLOAT, MPI_SUM, g_parallel_ctx.node_comm);
 
-    // Async copy back to device
-    CHECK_CUDA(cudaMemcpyAsync(y.data(), y_host, num_tokens * hidden_size * sizeof(float),
-                               cudaMemcpyHostToDevice, g_parallel_ctx.h2d_stream));
+    // Async H2D using pre-allocated pinned buffer
+    CHECK_CUDA(cudaMemcpyAsync(y.data(), h_allreduce_buffer_,
+                                num_tokens * hidden_size * sizeof(float),
+                                cudaMemcpyHostToDevice, g_parallel_ctx.h2d_stream));
     CHECK_CUDA(cudaStreamSynchronize(g_parallel_ctx.h2d_stream));
     y.mark_device_valid();
 }
@@ -1474,7 +1510,8 @@ void DecoderLayer::forward(const Tensor& x, const Tensor& cos, const Tensor& sin
 // LFM2Model Implementation
 // ============================================================================
 
-LFM2Model::LFM2Model(const std::string& model_file) {
+LFM2Model::LFM2Model(const std::string& model_file)
+    : d_input_ids_buffer_(nullptr), h_input_ids_buffer_(nullptr), input_ids_buffer_size_(0) {
     if (g_parallel_ctx.world_rank == 0) {
         std::cout << "Loading LFM2-8B-A1B model from " << model_file << std::endl;
     }
@@ -1493,11 +1530,44 @@ LFM2Model::LFM2Model(const std::string& model_file) {
 
     rotary_emb_ = std::make_unique<RotaryEmbedding>();
 
+    // Pre-allocate input buffers for typical batch size
+    ensure_input_buffers(256 * 2048);  // batch_size * seq_len
+
     if (g_parallel_ctx.world_rank == 0) {
         std::cout << "Model loaded successfully!" << std::endl;
         std::cout << "GPU memory used for weights: "
                   << (g_model_loader->get_cached_memory_bytes() / (1024.0 * 1024.0)) << " MB" << std::endl;
     }
+}
+
+LFM2Model::~LFM2Model() {
+    if (d_input_ids_buffer_ != nullptr) {
+        cudaFree(d_input_ids_buffer_);
+        d_input_ids_buffer_ = nullptr;
+    }
+    if (h_input_ids_buffer_ != nullptr) {
+        cudaFreeHost(h_input_ids_buffer_);
+        h_input_ids_buffer_ = nullptr;
+    }
+    input_ids_buffer_size_ = 0;
+}
+
+void LFM2Model::ensure_input_buffers(size_t size) {
+    if (size <= input_ids_buffer_size_) return;
+
+    // Free old buffers
+    if (d_input_ids_buffer_ != nullptr) {
+        cudaFree(d_input_ids_buffer_);
+    }
+    if (h_input_ids_buffer_ != nullptr) {
+        cudaFreeHost(h_input_ids_buffer_);
+    }
+
+    // Allocate new buffers with headroom
+    size_t new_size = size * 2;
+    CHECK_CUDA(cudaMalloc(&d_input_ids_buffer_, new_size * sizeof(int)));
+    CHECK_CUDA(cudaMallocHost(&h_input_ids_buffer_, new_size * sizeof(int)));
+    input_ids_buffer_size_ = new_size;
 }
 
 void LFM2Model::load_embeddings() {
@@ -1546,17 +1616,21 @@ void LFM2Model::forward(const std::vector<int>& input_ids, Tensor& logits) {
     size_t batch = 1;
     size_t seq_len = input_ids.size();
 
-    int* d_input_ids;
-    CHECK_CUDA(cudaMalloc(&d_input_ids, seq_len * sizeof(int)));
-    CHECK_CUDA(cudaMemcpy(d_input_ids, input_ids.data(), seq_len * sizeof(int), cudaMemcpyHostToDevice));
+    // Ensure buffers are large enough
+    ensure_input_buffers(seq_len);
+
+    // Copy to pinned host buffer, then async copy to device
+    std::memcpy(h_input_ids_buffer_, input_ids.data(), seq_len * sizeof(int));
+    CHECK_CUDA(cudaMemcpyAsync(d_input_ids_buffer_, h_input_ids_buffer_, seq_len * sizeof(int),
+                                cudaMemcpyHostToDevice, g_parallel_ctx.h2d_stream));
+    CHECK_CUDA(cudaStreamSynchronize(g_parallel_ctx.h2d_stream));
 
     Tensor hidden_states({batch, seq_len, HIDDEN_SIZE});
     size_t total = seq_len * HIDDEN_SIZE;
     int blocks = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
     embedding_lookup_kernel<<<blocks, BLOCK_SIZE>>>(
-        embed_tokens_.data(), d_input_ids, hidden_states.data(), seq_len, HIDDEN_SIZE);
+        embed_tokens_.data(), d_input_ids_buffer_, hidden_states.data(), seq_len, HIDDEN_SIZE);
     CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaFree(d_input_ids));
 
     Tensor cos({seq_len, HEAD_DIM});
     Tensor sin({seq_len, HEAD_DIM});
@@ -1585,21 +1659,25 @@ void LFM2Model::forward(const std::vector<int>& input_ids, Tensor& logits) {
 }
 
 void LFM2Model::forward_batch(const int* input_ids, size_t batch_size, size_t seq_len, Tensor& logits) {
-    // Allocate and copy input_ids to GPU
-    int* d_input_ids;
     size_t input_size = batch_size * seq_len;
-    CHECK_CUDA(cudaMalloc(&d_input_ids, input_size * sizeof(int)));
-    CHECK_CUDA(cudaMemcpy(d_input_ids, input_ids, input_size * sizeof(int), cudaMemcpyHostToDevice));
+
+    // Ensure buffers are large enough
+    ensure_input_buffers(input_size);
+
+    // Copy to pinned host buffer, then async copy to device
+    std::memcpy(h_input_ids_buffer_, input_ids, input_size * sizeof(int));
+    CHECK_CUDA(cudaMemcpyAsync(d_input_ids_buffer_, h_input_ids_buffer_, input_size * sizeof(int),
+                                cudaMemcpyHostToDevice, g_parallel_ctx.h2d_stream));
+    CHECK_CUDA(cudaStreamSynchronize(g_parallel_ctx.h2d_stream));
 
     // Embedding lookup: [batch_size, seq_len, hidden_size]
     Tensor hidden_states({batch_size, seq_len, HIDDEN_SIZE});
     size_t total_embed = batch_size * seq_len * HIDDEN_SIZE;
     int blocks_embed = (total_embed + BLOCK_SIZE - 1) / BLOCK_SIZE;
     embedding_lookup_batched_kernel<<<blocks_embed, BLOCK_SIZE>>>(
-        embed_tokens_.data(), d_input_ids, hidden_states.data(),
+        embed_tokens_.data(), d_input_ids_buffer_, hidden_states.data(),
         batch_size, seq_len, HIDDEN_SIZE);
     CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaFree(d_input_ids));
 
     // Compute RoPE embeddings (same for all batches, depends only on seq_len)
     Tensor cos({seq_len, HEAD_DIM});

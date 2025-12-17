@@ -43,6 +43,7 @@ private:
 class SparseMoeBlock {
 public:
     SparseMoeBlock(int layer_idx);
+    ~SparseMoeBlock();
     void forward(const Tensor& x, Tensor& y, Tensor& router_logits);
 
 private:
@@ -84,10 +85,15 @@ private:
     float* d_up_buf_;            // Intermediate: up projection output
     size_t expert_buffer_size_;  // Current buffer capacity (max total tokens)
 
+    // Pre-allocated pinned host buffer for allreduce (avoid cudaMallocHost per call)
+    float* h_allreduce_buffer_;
+    size_t allreduce_buffer_size_;
+
     void route_tokens_gpu(const Tensor& router_logits, size_t num_tokens);
     void ensure_routing_buffers(size_t num_tokens);
     void ensure_gather_scatter_buffers(size_t max_tokens_per_expert);
     void ensure_expert_buffers(size_t total_tokens);
+    void ensure_allreduce_buffer(size_t size);
 };
 
 // Multi-Head Attention
