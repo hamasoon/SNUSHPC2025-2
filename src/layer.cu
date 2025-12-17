@@ -18,9 +18,9 @@
 // BM, BN: Block tile size for M and N dimensions
 // BK: Block tile size for K dimension
 // TM, TN: Register tile size per thread (each thread computes TM x TN elements)
-#define BM 128
+#define BM 64
 #define BN 64
-#define BK 8
+#define BK 16
 #define TM 8
 #define TN 4
 

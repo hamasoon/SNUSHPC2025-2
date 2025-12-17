@@ -9,7 +9,7 @@
 #   ./run_profile.sh --roofline --ncu-kernel "gemm"  # Roofline for specific kernel
 
 : ${NODES:=1}
-: ${SAMPLES:=64}
+: ${SAMPLES:=128}
 
 # Parse arguments
 USE_NCU=0
@@ -107,13 +107,13 @@ if [ $USE_NCU -eq 1 ]; then
     NCU_CMD="$NCU_CMD --launch-skip $LAUNCH_SKIP --launch-count $LAUNCH_COUNT"
     echo "Launch skip: $LAUNCH_SKIP, Launch count: $LAUNCH_COUNT"
 
-    echo "Running: $NCU_CMD ./main -n $SAMPLES -b 64 $@"
+    echo "Running: $NCU_CMD ./main -n $SAMPLES -b 128 $@"
     echo ""
 
     salloc -N $NODES --partition class1 --exclusive --gres=gpu:4 \
         mpirun --bind-to none -mca btl ^openib -npernode 1 \
             --oversubscribe -quiet -x TMPDIR=$HOME \
-            $NCU_CMD ./main -n $SAMPLES -b 64 $@
+            $NCU_CMD ./main -n $SAMPLES -b 128 $@
 
     echo ""
     if [ $USE_ROOFLINE -eq 1 ]; then
@@ -143,5 +143,5 @@ else
     salloc -N $NODES --partition class1 --exclusive --gres=gpu:4 \
         mpirun --bind-to none -mca btl ^openib -npernode 4 \
             --oversubscribe -quiet \
-            nsys profile --cudabacktrace=all ./main -n 1024 -b 64 $@
+            nsys profile --cudabacktrace=all ./main -n 1024 -b 128 $@
 fi
