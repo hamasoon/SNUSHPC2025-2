@@ -461,11 +461,11 @@ __global__ void matmul_kernel_simple(const float* a, const float* b, float* c,
 // a: (m, k), b: (n, k), c: (m, n)
 // With Register Tiling, Double Buffering, and Warp-level parallelism
 // TITAN RTX (Turing) optimizations:
+// - Double buffering to overlap global memory loads with computation
 // - Shared memory padding (+4) to avoid bank conflicts (32 banks, 4 bytes each)
 // - Vectorized float4 loads for 128-bit memory transactions
 // - Coalesced global memory access pattern for 128-byte cache lines
-// - __launch_bounds__ to optimize register allocation for better occupancy
-__global__ __launch_bounds__(256, 4)
+__global__ __launch_bounds__(128, 4)
 void matmul_transposed_kernel(const float* __restrict__ a, const float* __restrict__ b,
                               float* __restrict__ c, size_t m, size_t k, size_t n) {
     const int tx = threadIdx.x;
@@ -487,64 +487,54 @@ void matmul_transposed_kernel(const float* __restrict__ a, const float* __restri
     float reg_a[TM];
     float reg_b[TN];
 
-    const int num_threads = (BM / TM) * (BN / TN);  // 256 threads
+    const int num_threads = (BM / TM) * (BN / TN);  // 128 threads
     const int tid = ty * (BN / TN) + tx;
 
     // Vectorized loading constants
-    // A tile: BM x BK = 128 x 8 = 1024 elements
-    // B tile: BN x BK = 64 x 8 = 512 elements
-    // With float4 (4 elements): A needs 256 float4 loads, B needs 128 float4 loads
     const int a_tile_float4 = (BM * BK) / 4;  // 256
-    const int b_tile_float4 = (BN * BK) / 4;  // 128
+    const int b_tile_float4 = (BN * BK) / 4;  // 256
 
     const int num_k_tiles = (k + BK - 1) / BK;
 
     int buf_idx = 0;
 
-    // Preload first tile with float4 vectorized loads
-    // A: Each thread loads consecutive elements along k dimension for better coalescing
+    // Preload first tile into buffer 0
     for (int i = tid; i < a_tile_float4; i += num_threads) {
-        // Each float4 covers 4 consecutive k elements for one row
-        int row_idx = i / (BK / 4);     // Which row (0 to BM-1)
-        int k_group = i % (BK / 4);     // Which group of 4 in k dimension (0 or 1 for BK=8)
+        int row_idx = i / (BK / 4);
+        int k_group = i % (BK / 4);
         int global_row = block_row + row_idx;
         int global_k_base = k_group * 4;
 
         if (global_row < m && global_k_base + 3 < k) {
-            // Aligned float4 load
             float4 tmp = *reinterpret_cast<const float4*>(&a[global_row * k + global_k_base]);
-            As[0][global_k_base + 0][row_idx] = tmp.x;
-            As[0][global_k_base + 1][row_idx] = tmp.y;
-            As[0][global_k_base + 2][row_idx] = tmp.z;
-            As[0][global_k_base + 3][row_idx] = tmp.w;
+            As[0][k_group * 4 + 0][row_idx] = tmp.x;
+            As[0][k_group * 4 + 1][row_idx] = tmp.y;
+            As[0][k_group * 4 + 2][row_idx] = tmp.z;
+            As[0][k_group * 4 + 3][row_idx] = tmp.w;
         } else {
-            // Boundary handling - scalar loads
             for (int kk = 0; kk < 4; kk++) {
                 int gk = global_k_base + kk;
-                As[0][gk][row_idx] = (global_row < m && gk < k) ? a[global_row * k + gk] : 0.0f;
+                As[0][k_group * 4 + kk][row_idx] = (global_row < m && gk < k) ? a[global_row * k + gk] : 0.0f;
             }
         }
     }
 
-    // B (transposed): b is (n, k), each row of B is k elements
     for (int i = tid; i < b_tile_float4; i += num_threads) {
-        int col_idx = i / (BK / 4);     // Which column (0 to BN-1)
-        int k_group = i % (BK / 4);     // Which group of 4 in k dimension
+        int col_idx = i / (BK / 4);
+        int k_group = i % (BK / 4);
         int global_col = block_col + col_idx;
         int global_k_base = k_group * 4;
 
         if (global_col < n && global_k_base + 3 < k) {
-            // Aligned float4 load
             float4 tmp = *reinterpret_cast<const float4*>(&b[global_col * k + global_k_base]);
-            Bs[0][global_k_base + 0][col_idx] = tmp.x;
-            Bs[0][global_k_base + 1][col_idx] = tmp.y;
-            Bs[0][global_k_base + 2][col_idx] = tmp.z;
-            Bs[0][global_k_base + 3][col_idx] = tmp.w;
+            Bs[0][k_group * 4 + 0][col_idx] = tmp.x;
+            Bs[0][k_group * 4 + 1][col_idx] = tmp.y;
+            Bs[0][k_group * 4 + 2][col_idx] = tmp.z;
+            Bs[0][k_group * 4 + 3][col_idx] = tmp.w;
         } else {
-            // Boundary handling - scalar loads
             for (int kk = 0; kk < 4; kk++) {
                 int gk = global_k_base + kk;
-                Bs[0][gk][col_idx] = (global_col < n && gk < k) ? b[global_col * k + gk] : 0.0f;
+                Bs[0][k_group * 4 + kk][col_idx] = (global_col < n && gk < k) ? b[global_col * k + gk] : 0.0f;
             }
         }
     }
@@ -556,8 +546,8 @@ void matmul_transposed_kernel(const float* __restrict__ a, const float* __restri
         int next_buf = 1 - buf_idx;
         int next_tile = tile + 1;
 
+        // Prefetch next tile into alternate buffer (if not last tile)
         if (next_tile < num_k_tiles) {
-            // Prefetch next A tile with float4
             for (int i = tid; i < a_tile_float4; i += num_threads) {
                 int row_idx = i / (BK / 4);
                 int k_group = i % (BK / 4);
@@ -573,13 +563,11 @@ void matmul_transposed_kernel(const float* __restrict__ a, const float* __restri
                 } else {
                     for (int kk = 0; kk < 4; kk++) {
                         int gk = global_k_base + kk;
-                        int local_k = k_group * 4 + kk;
-                        As[next_buf][local_k][row_idx] = (global_row < m && gk < k) ? a[global_row * k + gk] : 0.0f;
+                        As[next_buf][k_group * 4 + kk][row_idx] = (global_row < m && gk < k) ? a[global_row * k + gk] : 0.0f;
                     }
                 }
             }
 
-            // Prefetch next B tile with float4
             for (int i = tid; i < b_tile_float4; i += num_threads) {
                 int col_idx = i / (BK / 4);
                 int k_group = i % (BK / 4);
@@ -595,8 +583,7 @@ void matmul_transposed_kernel(const float* __restrict__ a, const float* __restri
                 } else {
                     for (int kk = 0; kk < 4; kk++) {
                         int gk = global_k_base + kk;
-                        int local_k = k_group * 4 + kk;
-                        Bs[next_buf][local_k][col_idx] = (global_col < n && gk < k) ? b[global_col * k + gk] : 0.0f;
+                        Bs[next_buf][k_group * 4 + kk][col_idx] = (global_col < n && gk < k) ? b[global_col * k + gk] : 0.0f;
                     }
                 }
             }
